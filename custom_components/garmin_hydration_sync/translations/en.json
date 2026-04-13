@@ -1,0 +1,68 @@
+{
+    "title": "Garmin Sync",
+    "config": {
+        "step": {
+            "user": {
+                "title": "Garmin Sync – Connect Account",
+                "description": "Enter your Garmin Connect credentials and select the sensors to sync.\n\nIf your account has two-factor authentication enabled, you will be prompted for a code on the next screen.",
+                "data": {
+                    "garmin_email": "Garmin Connect e-mail",
+                    "garmin_password": "Garmin Connect password",
+                    "water_sensor_entity": "Water intake sensor (mL today)",
+                    "weight_sensor_entity": "Body weight sensor (kg) – optional"
+                }
+            },
+            "mfa": {
+                "title": "Garmin Two-Factor Authentication",
+                "description": "Garmin sent a verification code to **{email}**.\n\nEnter the code below to complete setup.",
+                "data": {
+                    "code": "Verification code"
+                }
+            },
+            "reauth_confirm": {
+                "title": "Re-authenticate with Garmin",
+                "description": "Your Garmin session for **{email}** has expired.\n\nEnter your password to reconnect. If two-factor authentication is required, you will be prompted for a code on the next screen.",
+                "data": {
+                    "garmin_password": "Garmin Connect password"
+                }
+            }
+        },
+        "error": {
+            "entity_not_found": "The selected sensor entity was not found.",
+            "cannot_connect": "Could not connect to Garmin Connect. Check your e-mail/password and try again.",
+            "invalid_mfa_code": "The verification code was incorrect or timed out. Please try again."
+        },
+        "abort": {
+            "already_configured": "This Garmin account is already configured.",
+            "reauth_successful": "Re-authentication successful. Garmin Sync is reconnected.",
+            "unknown": "An unexpected error occurred during re-authentication."
+        }
+    },
+    "options": {
+        "step": {
+            "init": {
+                "title": "Garmin Sync – Options",
+                "description": "Update the sensors to sync. To change your Garmin password, remove and re-add the integration.",
+                "data": {
+                    "water_sensor_entity": "Water intake sensor (mL today)",
+                    "weight_sensor_entity": "Body weight sensor (kg) – optional"
+                }
+            }
+        },
+        "error": {
+            "entity_not_found": "The selected sensor entity was not found."
+        }
+    },
+    "services": {
+        "sync_now": {
+            "name": "Sync to Garmin now",
+            "description": "Immediately pushes the current hydration and weight sensor values to Garmin Connect.",
+            "fields": {
+                "entry_id": {
+                    "name": "Config entry ID",
+                    "description": "Optional – target a specific Garmin account when multiple are configured."
+                }
+            }
+        }
+    }
+}
