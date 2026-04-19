@@ -12,6 +12,8 @@ CONF_GARMIN_PASSWORD = "garmin_password"
 CONF_WATER_SENSOR    = "water_sensor_entity"
 # HA entity_id of the sensor reporting body weight in kg (optional)
 CONF_WEIGHT_SENSOR   = "weight_sensor_entity"
+# Sync Ab Wheel workouts to Garmin (listens for xiaomi_abwheel HA bus events)
+CONF_ABWHEEL_SYNC    = "abwheel_sync"
 
 # ── Services ─────────────────────────────────────────────────────────────────
 SERVICE_SYNC_NOW = "sync_now"
@@ -26,6 +28,7 @@ KEY_LAST_SYNC_ML         = "last_sync_ml"
 KEY_LAST_SYNC_WEIGHT_KG  = "last_sync_weight_kg"
 KEY_LAST_SYNC_DAYS       = "last_sync_days"
 KEY_LAST_SYNC_FAILED     = "last_sync_failed"
+KEY_LAST_SYNC_ABWHEEL    = "last_sync_abwheel"
 
 STATUS_OK    = "ok"
 STATUS_ERROR = "error"

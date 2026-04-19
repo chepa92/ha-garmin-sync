@@ -237,3 +237,71 @@ def _upload_weight_blocking(
     if isinstance(result, dict):
         return result
     return {"status": str(result) if result else "ok"}
+
+
+# ── Ab Wheel workout upload ──────────────────────────────────────────────────
+
+async def async_upload_abwheel_workout(
+    hass: HomeAssistant,
+    email: str,
+    password: str,
+    reps: int,
+    calories: int,
+    duration_sec: int,
+    start_time: str,
+    prompt_mfa: Callable[[], str] | None = None,
+) -> dict[str, Any]:
+    """Create a strength_training activity on Garmin Connect for an Ab Wheel workout."""
+    token_dir = hass.config.path(TOKEN_SUBDIR)
+    return await hass.async_add_executor_job(
+        _upload_abwheel_blocking, token_dir, email, password,
+        reps, calories, duration_sec, start_time, prompt_mfa,
+    )
+
+
+def _upload_abwheel_blocking(
+    token_dir: str,
+    email: str,
+    password: str,
+    reps: int,
+    calories: int,
+    duration_sec: int,
+    start_time: str,
+    prompt_mfa: Callable[[], str] | None,
+) -> dict[str, Any]:
+    """Blocking Ab Wheel workout upload – runs in the executor thread pool."""
+    from datetime import datetime as _dt
+
+    client = _build_client_and_login(token_dir, email, password, prompt_mfa)
+
+    # Parse start_time (could be ISO string from HA timestamp sensor or unix ts)
+    try:
+        if start_time.replace(".", "").replace("-", "").isdigit():
+            start_dt = _dt.fromtimestamp(int(float(start_time)))
+        else:
+            start_dt = _dt.fromisoformat(start_time)
+    except (ValueError, OSError):
+        start_dt = _dt.now()
+
+    activity_name = f"Ab Wheel – {reps} reps"
+    duration_min = max(int(duration_sec // 60), 1)
+
+    LOGGER.info(
+        "[GarminSync] Uploading Ab Wheel workout: %d reps, %d cal, %ds at %s",
+        reps, calories, duration_sec, start_dt.strftime("%Y-%m-%d %H:%M"),
+    )
+
+    result = client.create_manual_activity(
+        activity_name=activity_name,
+        start_datetime=start_dt.strftime("%Y-%m-%dT%H:%M:%S.000"),
+        time_zone="Europe/Moscow",
+        type_key="strength_training",
+        distance_km=0,
+        duration_min=duration_min,
+    )
+
+    LOGGER.debug("[GarminSync] Ab Wheel upload result: %s", result)
+
+    if isinstance(result, dict):
+        return result
+    return {"status": str(result) if result else "ok"}

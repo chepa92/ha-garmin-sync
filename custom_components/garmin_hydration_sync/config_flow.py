@@ -17,6 +17,7 @@ from .const import (
     CONF_GARMIN_PASSWORD,
     CONF_WATER_SENSOR,
     CONF_WEIGHT_SENSOR,
+    CONF_ABWHEEL_SYNC,
     DOMAIN,
     LOGGER,
 )
@@ -25,8 +26,23 @@ from .garmin_connect import async_login_only
 
 # ── Schema helpers ───────────────────────────────────────────────────────────
 
+def _optional_entity(key: str, defaults: dict[str, Any]) -> dict:
+    """Build an optional entity selector field, with default only if set."""
+    val = defaults.get(key)
+    if val:
+        return {
+            vol.Optional(key, default=val): selector.EntitySelector(
+                selector.EntitySelectorConfig(domain="sensor")
+            )
+        }
+    return {
+        vol.Optional(key): selector.EntitySelector(
+            selector.EntitySelectorConfig(domain="sensor")
+        )
+    }
+
+
 def _user_schema(defaults: dict[str, Any], hass: HomeAssistant) -> vol.Schema:
-    weight_default = defaults.get(CONF_WEIGHT_SENSOR)  # None if not set
     return vol.Schema(
         {
             vol.Required(
@@ -39,29 +55,12 @@ def _user_schema(defaults: dict[str, Any], hass: HomeAssistant) -> vol.Schema:
             ): selector.TextSelector(
                 selector.TextSelectorConfig(type=selector.TextSelectorType.PASSWORD)
             ),
-            vol.Required(
-                CONF_WATER_SENSOR,
-                default=defaults.get(CONF_WATER_SENSOR, ""),
-            ): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain="sensor")
-            ),
-            **(
-                {
-                    vol.Optional(
-                        CONF_WEIGHT_SENSOR, default=weight_default
-                    ): selector.EntitySelector(
-                        selector.EntitySelectorConfig(domain="sensor")
-                    )
-                }
-                if weight_default
-                else {
-                    vol.Optional(
-                        CONF_WEIGHT_SENSOR
-                    ): selector.EntitySelector(
-                        selector.EntitySelectorConfig(domain="sensor")
-                    )
-                }
-            ),
+            **_optional_entity(CONF_WATER_SENSOR, defaults),
+            **_optional_entity(CONF_WEIGHT_SENSOR, defaults),
+            vol.Optional(
+                CONF_ABWHEEL_SYNC,
+                default=defaults.get(CONF_ABWHEEL_SYNC, False),
+            ): selector.BooleanSelector(),
         }
     )
 
@@ -91,32 +90,14 @@ def _reauth_schema(defaults: dict[str, Any]) -> vol.Schema:
 
 
 def _options_schema(defaults: dict[str, Any], hass: HomeAssistant) -> vol.Schema:
-    weight_default = defaults.get(CONF_WEIGHT_SENSOR)  # None if not set
     return vol.Schema(
         {
-            vol.Required(
-                CONF_WATER_SENSOR,
-                default=defaults.get(CONF_WATER_SENSOR, ""),
-            ): selector.EntitySelector(
-                selector.EntitySelectorConfig(domain="sensor")
-            ),
-            **(
-                {
-                    vol.Optional(
-                        CONF_WEIGHT_SENSOR, default=weight_default
-                    ): selector.EntitySelector(
-                        selector.EntitySelectorConfig(domain="sensor")
-                    )
-                }
-                if weight_default
-                else {
-                    vol.Optional(
-                        CONF_WEIGHT_SENSOR
-                    ): selector.EntitySelector(
-                        selector.EntitySelectorConfig(domain="sensor")
-                    )
-                }
-            ),
+            **_optional_entity(CONF_WATER_SENSOR, defaults),
+            **_optional_entity(CONF_WEIGHT_SENSOR, defaults),
+            vol.Optional(
+                CONF_ABWHEEL_SYNC,
+                default=defaults.get(CONF_ABWHEEL_SYNC, False),
+            ): selector.BooleanSelector(),
         }
     )
 
@@ -156,9 +137,14 @@ class GarminHydrationSyncConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            sensor_id: str = user_input[CONF_WATER_SENSOR]
-            if self.hass.states.get(sensor_id) is None:
-                errors[CONF_WATER_SENSOR] = "entity_not_found"
+            # At least one sensor must be configured
+            has_any = any([
+                user_input.get(CONF_WATER_SENSOR),
+                user_input.get(CONF_WEIGHT_SENSOR),
+                user_input.get(CONF_ABWHEEL_SYNC, False),
+            ])
+            if not has_any:
+                errors["base"] = "no_sensors"
             else:
                 # Set unique ID early so duplicates are blocked
                 await self.async_set_unique_id(user_input[CONF_GARMIN_EMAIL].lower())
@@ -284,11 +270,13 @@ class GarminHydrationSyncConfigFlow(ConfigFlow, domain=DOMAIN):
         data: dict[str, Any] = {
             CONF_GARMIN_EMAIL: email,
             CONF_GARMIN_PASSWORD: self._stored_input[CONF_GARMIN_PASSWORD],
-            CONF_WATER_SENSOR: self._stored_input[CONF_WATER_SENSOR],
         }
-        weight = self._stored_input.get(CONF_WEIGHT_SENSOR, "")
-        if weight:
-            data[CONF_WEIGHT_SENSOR] = weight
+        for k in (CONF_WATER_SENSOR, CONF_WEIGHT_SENSOR):
+            v = self._stored_input.get(k, "")
+            if v:
+                data[k] = v
+        if self._stored_input.get(CONF_ABWHEEL_SYNC, False):
+            data[CONF_ABWHEEL_SYNC] = True
         return self.async_create_entry(title=f"Garmin \u2013 {email}", data=data)
 
     def _finish_reauth(self) -> FlowResult:
@@ -393,14 +381,21 @@ class GarminHydrationSyncOptionsFlow(OptionsFlow):
         current = {**self._entry.data, **self._entry.options}
 
         if user_input is not None:
-            sensor_id: str = user_input[CONF_WATER_SENSOR]
-            if self.hass.states.get(sensor_id) is None:
-                errors[CONF_WATER_SENSOR] = "entity_not_found"
+            has_any = any([
+                user_input.get(CONF_WATER_SENSOR),
+                user_input.get(CONF_WEIGHT_SENSOR),
+                user_input.get(CONF_ABWHEEL_SYNC, False),
+            ])
+            if not has_any:
+                errors["base"] = "no_sensors"
             else:
-                out: dict[str, Any] = {CONF_WATER_SENSOR: sensor_id}
-                weight = user_input.get(CONF_WEIGHT_SENSOR, "")
-                if weight:
-                    out[CONF_WEIGHT_SENSOR] = weight
+                out: dict[str, Any] = {}
+                for k in (CONF_WATER_SENSOR, CONF_WEIGHT_SENSOR):
+                    v = user_input.get(k, "")
+                    if v:
+                        out[k] = v
+                if user_input.get(CONF_ABWHEEL_SYNC, False):
+                    out[CONF_ABWHEEL_SYNC] = True
                 return self.async_create_entry(title="", data=out)
 
         return self.async_show_form(

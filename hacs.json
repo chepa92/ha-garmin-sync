@@ -1,6 +1,6 @@
 {
     "name": "Garmin Sync",
-    "content_in_root": false,
-    "hide_default_branch": true,
+    "hacs": "2.0.0",
+    "render_readme": true,
     "homeassistant": "2024.11.0"
 }

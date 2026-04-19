@@ -8,8 +8,9 @@
                 "data": {
                     "garmin_email": "Garmin Connect e-mail",
                     "garmin_password": "Garmin Connect password",
-                    "water_sensor_entity": "Water intake sensor (mL today)",
-                    "weight_sensor_entity": "Body weight sensor (kg) – optional"
+                    "water_sensor_entity": "Water intake sensor (mL today) – optional",
+                    "weight_sensor_entity": "Body weight sensor (kg) – optional",
+                    "abwheel_sync": "Sync Ab Wheel workouts to Garmin"
                 }
             },
             "mfa": {
@@ -29,6 +30,7 @@
         },
         "error": {
             "entity_not_found": "The selected sensor entity was not found.",
+            "no_sensors": "Select at least one sensor to sync.",
             "cannot_connect": "Could not connect to Garmin Connect. Check your e-mail/password and try again.",
             "invalid_mfa_code": "The verification code was incorrect or timed out. Please try again."
         },
@@ -45,7 +47,8 @@
                 "description": "Update the sensors to sync. To change your Garmin password, remove and re-add the integration.",
                 "data": {
                     "water_sensor_entity": "Water intake sensor (mL today)",
-                    "weight_sensor_entity": "Body weight sensor (kg) – optional"
+                    "weight_sensor_entity": "Body weight sensor (kg) – optional",
+                    "abwheel_sync": "Sync Ab Wheel workouts to Garmin"
                 }
             }
         },
