@@ -8,6 +8,6 @@
     "codeowners": ["@chepa92"],
     "requirements": ["garminconnect>=0.3.0", "curl_cffi>=0.7.0"],
     "iot_class": "cloud_push",
-    "version": "1.1.0",
+    "version": "1.2.1",
     "homeassistant": "2024.11.0"
 }

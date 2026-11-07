@@ -1,4 +1,4 @@
-"""Garmin Connect hydration upload helper.
+"""Garmin Connect upload helpers.
 
 Uses the ``garminconnect`` library (cyberjunky/python-garminconnect) which
 implements the current Garmin mobile SSO auth flow.
@@ -8,28 +8,39 @@ implements the current Garmin mobile SSO auth flow.
 Garmin may require a one-time code on first login.  The caller supplies an
 optional ``prompt_mfa`` callable; during the Config Flow the flow itself
 provides this callback (blocking on a threading.Queue until the user submits
-the MFA step).  During normal hourly syncs the tokens are already cached so
-no MFA is expected.
+the MFA step).  During normal event-driven syncs the tokens are already
+cached so no MFA is expected.
 
-Token cache location:
-  <HA config>/.garmin_hydration_sync_tokens/garmin_tokens.json
+Token cache location (one file per Garmin account):
+  <HA config>/.garmin_sync_tokens/garmin_tokens_<email>.json
 
 Tokens auto-refresh indefinitely – 2FA is NOT required again as long as the
 refresh token stays valid (typically until you log out from all devices or
 Garmin invalidates it server-side).
 
-Limitations:
-  • The upload uses add_hydration_data() with a delta (current→target), so
-  • existing manual entries in the Garmin app are preserved and not doubled.
+Hydration uses add_hydration_data() with a delta, so existing manual entries
+in the Garmin app are preserved and not doubled.
 """
 from __future__ import annotations
 
 import os
+import re
+import threading
+from datetime import datetime, timezone, tzinfo
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from homeassistant.core import HomeAssistant
 
 from .const import LOGGER, TOKEN_SUBDIR
+
+# Legacy single token file shared by all accounts (pre-1.2.1)
+_LEGACY_TOKEN_FILE = "garmin_tokens.json"
+
+# Serialises background logins/uploads per token file so two concurrent
+# executor jobs never refresh / rewrite the same token file at once.
+_TOKEN_LOCKS: dict[str, threading.Lock] = {}
+_TOKEN_LOCKS_GUARD = threading.Lock()
 
 
 class GarminAuthExpiredError(Exception):
@@ -40,55 +51,53 @@ class GarminAuthExpiredError(Exception):
     """
 
 
-async def async_upload_hydration(
-    hass: HomeAssistant,
-    email: str,
-    password: str,
-    delta_ml: float,
-    date_str: str,
-    prompt_mfa: Callable[[], str] | None = None,
-) -> dict[str, Any]:
-    """Add ``delta_ml`` millilitres to Garmin Connect for ``date_str``.
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-    ``delta_ml`` is the *increment* to push (positive only – callers must
-    ensure it is > 0 before calling this function).
+def _token_file(token_dir: str, email: str) -> str:
+    """Return the per-account token file path."""
+    slug = re.sub(r"[^a-z0-9]+", "_", email.strip().lower()).strip("_") or "default"
+    return os.path.join(token_dir, f"garmin_tokens_{slug}.json")
 
-    Args:
-        hass:       HomeAssistant instance (provides config path + executor).
-        email:      Garmin Connect account e-mail.
-        password:   Garmin Connect account password.
-        delta_ml:   Millilitres to add to Garmin's daily total for *date_str*.
-        date_str:   Target date in ``YYYY-MM-DD`` format.
-        prompt_mfa: Optional callable for 2FA.  Tokens are cached after setup
-                    so this is ``None`` during normal hourly syncs.
 
-    Returns:
-        Response dict from the Garmin API.
+def _token_lock(token_file: str) -> threading.Lock:
+    with _TOKEN_LOCKS_GUARD:
+        return _TOKEN_LOCKS.setdefault(token_file, threading.Lock())
 
-    Raises:
-        RuntimeError: on missing library, auth failure, or API error.
+
+def _migrate_legacy_token(token_dir: str, token_file: str) -> None:
+    """Move the old shared token file to the per-account location (once).
+
+    The file is *moved*, not copied, so at most one account can inherit it.
     """
-    token_dir = hass.config.path(TOKEN_SUBDIR)
-    return await hass.async_add_executor_job(
-        _upload_blocking, token_dir, email, password, delta_ml, date_str, prompt_mfa
-    )
+    legacy = os.path.join(token_dir, _LEGACY_TOKEN_FILE)
+    if not os.path.exists(token_file) and os.path.isfile(legacy):
+        try:
+            os.replace(legacy, token_file)
+            LOGGER.info("[GarminSync] Migrated legacy token cache to %s", token_file)
+        except OSError as exc:
+            LOGGER.debug("[GarminSync] Could not migrate legacy token file: %s", exc)
 
 
-async def async_login_only(
-    hass: HomeAssistant,
-    email: str,
-    password: str,
-    prompt_mfa: Callable[[], str] | None = None,
-) -> None:
-    """Authenticate with Garmin Connect and cache tokens (async).
+def parse_workout_start(start_time: str, tz: tzinfo) -> datetime | None:
+    """Parse a workout start time (unix timestamp or ISO string) into ``tz``.
 
-    Used by the Config Flow to perform the initial login (and handle 2FA)
-    before any data upload is needed.
+    Naive ISO strings are interpreted as local time in ``tz``.  Returns None
+    if the value can't be parsed.
     """
-    token_dir = hass.config.path(TOKEN_SUBDIR)
-    await hass.async_add_executor_job(
-        _login_blocking, token_dir, email, password, prompt_mfa
-    )
+    value = (start_time or "").strip()
+    if not value:
+        return None
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).astimezone(tz)
+    except (ValueError, OverflowError, OSError):
+        pass
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=tz)
+    return dt.astimezone(tz)
 
 
 def _build_client_and_login(
@@ -101,18 +110,15 @@ def _build_client_and_login(
 
     Background mode (``prompt_mfa is None``)
     ─────────────────────────────────────────
-    Calls ``client.login(token_file)`` which first tries ``client.load()`` to
-    restore the cached token, auto-refreshes via the DI refresh token if almost
-    expired, and only falls back to full SSO login if the cache is unusable.
+    Calls ``client.login(token_file)`` which first tries to restore the cached
+    token, auto-refreshes via the DI refresh token if almost expired, and only
+    falls back to full SSO login if the cache is unusable.
 
     If the full SSO login reaches the MFA-code step (i.e. the refresh token has
     expired and a new session is required), our ``_background_mfa`` callback
-    raises ``GarminAuthExpiredError`` instead of blocking.  The coordinator
-    catches it and calls ``entry.async_start_reauth()`` so the user sees a
-    notification in the HA UI.
-
-    Important: even when Garmin sends an MFA email while re-attempting SSO, the
-    user is now also prompted via the HA reauth flow, so the email is expected.
+    records it and aborts; we then raise ``GarminAuthExpiredError``.  The
+    coordinator catches it and calls ``entry.async_start_reauth()`` so the user
+    sees a notification in the HA UI.
 
     Interactive mode (``prompt_mfa`` provided)
     ──────────────────────────────────────────
@@ -129,15 +135,14 @@ def _build_client_and_login(
         ) from exc
 
     os.makedirs(token_dir, exist_ok=True)
-    token_file = os.path.join(token_dir, "garmin_tokens.json")
+    token_file = _token_file(token_dir, email)
+    _migrate_legacy_token(token_dir, token_file)
 
     if prompt_mfa is None:
-        # Background mode — track whether garminconnect called our mfa callback
-        # (which means the cached token is gone and a full re-login is needed).
-        # We cannot raise GarminAuthExpiredError directly from inside the callback
-        # because garminconnect's outer except-handler wraps all unknown exceptions
-        # into GarminConnectConnectionError.  Instead we use a flag and re-raise
-        # the right type AFTER client.login() returns.
+        # We cannot raise GarminAuthExpiredError directly from inside the
+        # callback because garminconnect wraps unknown exceptions into
+        # GarminConnectConnectionError.  Use a flag and re-raise the right
+        # type AFTER client.login() returns.
         mfa_triggered: list[bool] = []
 
         def _background_mfa() -> str:
@@ -163,34 +168,68 @@ def _build_client_and_login(
     return client
 
 
-def _login_blocking(
+def _run_with_client(
     token_dir: str,
     email: str,
     password: str,
     prompt_mfa: Callable[[], str] | None,
+    action: Callable[[Any], Any],
+) -> dict[str, Any]:
+    """Log in and run ``action(client)``, serialised per account."""
+    with _token_lock(_token_file(token_dir, email)):
+        client = _build_client_and_login(token_dir, email, password, prompt_mfa)
+        result = action(client)
+    if isinstance(result, dict):
+        return result
+    return {"status": str(result) if result else "ok"}
+
+
+# ── Login (config flow) ──────────────────────────────────────────────────────
+
+async def async_login_only(
+    hass: HomeAssistant,
+    email: str,
+    password: str,
+    prompt_mfa: Callable[[], str] | None = None,
 ) -> None:
-    """Blocking login – runs in the executor thread pool."""
-    _build_client_and_login(token_dir, email, password, prompt_mfa)
+    """Authenticate with Garmin Connect and cache tokens (async).
+
+    Used by the Config Flow to perform the initial login (and handle 2FA)
+    before any data upload is needed.  Not serialised with the upload lock,
+    because it may block for minutes waiting on the user's 2FA code.
+    """
+    token_dir = hass.config.path(TOKEN_SUBDIR)
+    await hass.async_add_executor_job(
+        _build_client_and_login, token_dir, email, password, prompt_mfa
+    )
 
 
-def _upload_blocking(
-    token_dir: str,
+# ── Hydration upload ─────────────────────────────────────────────────────────
+
+async def async_upload_hydration(
+    hass: HomeAssistant,
     email: str,
     password: str,
     delta_ml: float,
     date_str: str,
-    prompt_mfa: Callable[[], str] | None,
+    prompt_mfa: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
-    """Blocking upload – runs in the executor thread pool."""
-    client = _build_client_and_login(token_dir, email, password, prompt_mfa)
+    """Add ``delta_ml`` millilitres to Garmin Connect for ``date_str``.
 
-    LOGGER.debug("[GarminSync] %s: adding +%g mL to Garmin", date_str, delta_ml)
-    result = client.add_hydration_data(delta_ml, cdate=date_str)
-    LOGGER.debug("[GarminSync] Upload result for %s: %s", date_str, result)
+    ``delta_ml`` is the *increment* to push (positive only – callers must
+    ensure it is > 0 before calling this function).
+    """
+    token_dir = hass.config.path(TOKEN_SUBDIR)
 
-    if isinstance(result, dict):
+    def _action(client: Any) -> Any:
+        LOGGER.debug("[GarminSync] %s: adding +%g mL to Garmin", date_str, delta_ml)
+        result = client.add_hydration_data(delta_ml, cdate=date_str)
+        LOGGER.debug("[GarminSync] Upload result for %s: %s", date_str, result)
         return result
-    return {"status": str(result) if result else "ok"}
+
+    return await hass.async_add_executor_job(
+        _run_with_client, token_dir, email, password, prompt_mfa, _action
+    )
 
 
 # ── Weight upload ─────────────────────────────────────────────────────────────
@@ -202,41 +241,18 @@ async def async_upload_weight(
     weight_kg: float,
     prompt_mfa: Callable[[], str] | None = None,
 ) -> dict[str, Any]:
-    """Upload a body weight reading to Garmin Connect (async).
-
-    Args:
-        hass:       HomeAssistant instance.
-        email:      Garmin Connect account e-mail.
-        password:   Garmin Connect account password.
-        weight_kg:  Body weight in kilograms.
-        prompt_mfa: Optional 2FA callback (not needed after initial login).
-
-    Returns:
-        Response dict from the Garmin API.
-    """
+    """Upload a body weight reading (kg) to Garmin Connect."""
     token_dir = hass.config.path(TOKEN_SUBDIR)
-    return await hass.async_add_executor_job(
-        _upload_weight_blocking, token_dir, email, password, weight_kg, prompt_mfa
-    )
 
-
-def _upload_weight_blocking(
-    token_dir: str,
-    email: str,
-    password: str,
-    weight_kg: float,
-    prompt_mfa: Callable[[], str] | None,
-) -> dict[str, Any]:
-    """Blocking weight upload – runs in the executor thread pool."""
-    client = _build_client_and_login(token_dir, email, password, prompt_mfa)
-
-    LOGGER.debug("[GarminSync] Uploading weight: %.2f kg", weight_kg)
-    result = client.add_weigh_in(weight_kg, unitKey="kg")
-    LOGGER.debug("[GarminSync] Weight upload result: %s", result)
-
-    if isinstance(result, dict):
+    def _action(client: Any) -> Any:
+        LOGGER.debug("[GarminSync] Uploading weight: %.2f kg", weight_kg)
+        result = client.add_weigh_in(weight_kg, unitKey="kg")
+        LOGGER.debug("[GarminSync] Weight upload result: %s", result)
         return result
-    return {"status": str(result) if result else "ok"}
+
+    return await hass.async_add_executor_job(
+        _run_with_client, token_dir, email, password, prompt_mfa, _action
+    )
 
 
 # ── Ab Wheel workout upload ──────────────────────────────────────────────────
@@ -253,55 +269,51 @@ async def async_upload_abwheel_workout(
 ) -> dict[str, Any]:
     """Create a strength_training activity on Garmin Connect for an Ab Wheel workout."""
     token_dir = hass.config.path(TOKEN_SUBDIR)
-    return await hass.async_add_executor_job(
-        _upload_abwheel_blocking, token_dir, email, password,
-        reps, calories, duration_sec, start_time, prompt_mfa,
-    )
+    tz_name: str = hass.config.time_zone or "UTC"
+    tz = await hass.async_add_executor_job(ZoneInfo, tz_name)
 
+    start_dt = parse_workout_start(start_time, tz)
+    if start_dt is None:
+        LOGGER.warning(
+            "[GarminSync] Could not parse Ab Wheel start_time %r – using now", start_time
+        )
+        start_dt = datetime.now(tz)
 
-def _upload_abwheel_blocking(
-    token_dir: str,
-    email: str,
-    password: str,
-    reps: int,
-    calories: int,
-    duration_sec: int,
-    start_time: str,
-    prompt_mfa: Callable[[], str] | None,
-) -> dict[str, Any]:
-    """Blocking Ab Wheel workout upload – runs in the executor thread pool."""
-    from datetime import datetime as _dt
+    duration = max(int(duration_sec), 60)
+    payload: dict[str, Any] = {
+        "activityTypeDTO": {"typeKey": "strength_training"},
+        "accessControlRuleDTO": {"typeId": 2, "typeKey": "private"},
+        "timeZoneUnitDTO": {"unitKey": tz_name},
+        "activityName": f"Ab Wheel – {reps} reps",
+        "metadataDTO": {"autoCalcCalories": calories <= 0},
+        "summaryDTO": {
+            "startTimeLocal": start_dt.strftime("%Y-%m-%dT%H:%M:%S.000"),
+            "distance": 0,
+            "duration": duration,
+        },
+    }
+    if calories > 0:
+        payload["summaryDTO"]["calories"] = calories
 
-    client = _build_client_and_login(token_dir, email, password, prompt_mfa)
-
-    # Parse start_time (could be ISO string from HA timestamp sensor or unix ts)
-    try:
-        if start_time.replace(".", "").replace("-", "").isdigit():
-            start_dt = _dt.fromtimestamp(int(float(start_time)))
-        else:
-            start_dt = _dt.fromisoformat(start_time)
-    except (ValueError, OSError):
-        start_dt = _dt.now()
-
-    activity_name = f"Ab Wheel – {reps} reps"
-    duration_min = max(int(duration_sec // 60), 1)
-
-    LOGGER.info(
-        "[GarminSync] Uploading Ab Wheel workout: %d reps, %d cal, %ds at %s",
-        reps, calories, duration_sec, start_dt.strftime("%Y-%m-%d %H:%M"),
-    )
-
-    result = client.create_manual_activity(
-        activity_name=activity_name,
-        start_datetime=start_dt.strftime("%Y-%m-%dT%H:%M:%S.000"),
-        time_zone="Europe/Moscow",
-        type_key="strength_training",
-        distance_km=0,
-        duration_min=duration_min,
-    )
-
-    LOGGER.debug("[GarminSync] Ab Wheel upload result: %s", result)
-
-    if isinstance(result, dict):
+    def _action(client: Any) -> Any:
+        LOGGER.info(
+            "[GarminSync] Uploading Ab Wheel workout: %d reps, %d cal, %ds at %s (%s)",
+            reps, calories, duration_sec, start_dt.strftime("%Y-%m-%d %H:%M"), tz_name,
+        )
+        if hasattr(client, "create_manual_activity_from_json"):
+            result = client.create_manual_activity_from_json(payload)
+        else:  # older garminconnect: minutes only, no calories
+            result = client.create_manual_activity(
+                start_datetime=payload["summaryDTO"]["startTimeLocal"],
+                time_zone=tz_name,
+                type_key="strength_training",
+                distance_km=0,
+                duration_min=max(round(duration / 60), 1),
+                activity_name=payload["activityName"],
+            )
+        LOGGER.debug("[GarminSync] Ab Wheel upload result: %s", result)
         return result
-    return {"status": str(result) if result else "ok"}
+
+    return await hass.async_add_executor_job(
+        _run_with_client, token_dir, email, password, prompt_mfa, _action
+    )

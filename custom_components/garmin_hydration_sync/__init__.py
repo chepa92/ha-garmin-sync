@@ -1,19 +1,24 @@
 """Garmin Sync – Home Assistant integration.
 
-Pushes hydration and body-weight data to Garmin Connect whenever the
-corresponding HA sensors change state.  No polling, no recorder history.
+Pushes hydration, body-weight and Ab Wheel workout data to Garmin Connect
+whenever the corresponding HA sensors / events fire.  No polling, no recorder
+history.
 
 Hydration
 ---------
 The water sensor (e.g. Water.io) is a cumulative "today" counter that resets
 at midnight.  We track how many mL we have already sent for each calendar day
 in a persistent Store and only push the *increment* since the last sync.
+All hydration pushes are serialised by a lock and the increment is computed
+inside it, so rapid sensor updates can never double-count.
 
 Weight
 ------
-Whenever the weight sensor produces a new valid reading we push it straight
-to Garmin Connect via add_weigh_in().  Each weigh-in is an independent entry
-so no duplicate-tracking is needed.
+Whenever the weight sensor produces a new valid reading we push it to Garmin
+Connect via add_weigh_in().  The last pushed value is persisted, and a reading
+identical to the last one pushed on the same day is skipped, so HA restarts,
+Bluetooth reconnects and attribute-only updates don't create duplicate
+weigh-ins.
 
 Invalid states
 --------------
@@ -23,10 +28,11 @@ Bluetooth range or the integration is restarting.
 """
 from __future__ import annotations
 
+import asyncio
 import glob
 import json
 import os
-from datetime import datetime
+from datetime import timedelta
 from typing import Any
 
 import voluptuous as vol
@@ -38,6 +44,7 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_GARMIN_EMAIL,
@@ -64,6 +71,7 @@ from .garmin_connect import (
     async_upload_hydration,
     async_upload_weight,
     async_upload_abwheel_workout,
+    parse_workout_start,
 )
 
 PLATFORMS: list[Platform] = [Platform.BUTTON, Platform.SENSOR]
@@ -73,6 +81,10 @@ _MAX_DAILY_ML = 9000
 # Sanity range for body weight (kg)
 _MIN_WEIGHT_KG = 20.0
 _MAX_WEIGHT_KG = 300.0
+# Two weight readings closer than this are considered identical
+_WEIGHT_EPSILON_KG = 0.01
+# How many days of per-day hydration totals to keep in the Store
+_HYDRATION_KEEP_DAYS = 14
 # Persistent storage version
 _STORE_VERSION = 1
 
@@ -80,7 +92,7 @@ _STORE_VERSION = 1
 _BAD_STATES = {STATE_UNAVAILABLE, STATE_UNKNOWN, "unknown", "unavailable", "", None}
 
 
-def _parse_positive_float(state_value: str) -> float | None:
+def _parse_positive_float(state_value: str | None) -> float | None:
     """Return a positive float from a state string, or None if invalid."""
     if state_value in _BAD_STATES:
         return None
@@ -89,6 +101,18 @@ def _parse_positive_float(state_value: str) -> float | None:
         return v if v > 0 else None
     except (ValueError, TypeError):
         return None
+
+
+def _to_int(value: Any, default: int = 0) -> int:
+    """Best-effort int conversion for event / journal payload values."""
+    try:
+        return int(float(value))
+    except (ValueError, TypeError):
+        return default
+
+
+def _now_iso() -> str:
+    return dt_util.now().isoformat(timespec="seconds")
 
 
 class GarminSyncCoordinator(DataUpdateCoordinator):
@@ -119,6 +143,11 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
         # Persistent store: {"YYYY-MM-DD": mL_already_sent_to_Garmin}
         self._store: Store = Store(hass, _STORE_VERSION, f"{DOMAIN}.{entry.entry_id}.sent")
         self._sent_hydration: dict[str, float] = {}
+        self._hydration_lock = asyncio.Lock()
+        # Persistent last pushed weight: {"kg": float, "date": "YYYY-MM-DD"}
+        self._weight_store: Store = Store(hass, _STORE_VERSION, f"{DOMAIN}.{entry.entry_id}.weight")
+        self._last_weight: dict[str, Any] = {}
+        self._weight_lock = asyncio.Lock()
         # Persistent set of synced abwheel workout start_times (dedup key)
         self._abwheel_store: Store = Store(hass, _STORE_VERSION, f"{DOMAIN}.{entry.entry_id}.abwheel")
         self._synced_workouts: set[str] = set()
@@ -136,21 +165,44 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
                 k: float(v) for k, v in stored.items()
                 if isinstance(v, (int, float))
             }
+        weight_stored = await self._weight_store.async_load()
+        if isinstance(weight_stored, dict):
+            self._last_weight = weight_stored
         # Load synced abwheel workout keys
         abwheel_stored = await self._abwheel_store.async_load()
         if isinstance(abwheel_stored, list):
-            self._synced_workouts = set(abwheel_stored)
+            self._synced_workouts = {str(x) for x in abwheel_stored}
 
     async def async_save_store(self) -> None:
+        # Prune old days so the store doesn't grow forever
+        cutoff = (dt_util.now() - timedelta(days=_HYDRATION_KEEP_DAYS)).strftime("%Y-%m-%d")
+        self._sent_hydration = {
+            k: v for k, v in self._sent_hydration.items() if k >= cutoff
+        }
         await self._store.async_save(self._sent_hydration)
 
     async def _save_abwheel_store(self) -> None:
-        await self._abwheel_store.async_save(list(self._synced_workouts))
+        await self._abwheel_store.async_save(sorted(self._synced_workouts))
 
     # ── Config helper ─────────────────────────────────────────────────────────
 
     def get_config(self) -> dict[str, Any]:
         return {**self.entry.data, **self.entry.options}
+
+    # ── Status helpers ────────────────────────────────────────────────────────
+
+    def _set_status(self, status: str, **extra: Any) -> None:
+        self.async_set_updated_data({
+            **self.data,
+            KEY_LAST_SYNC_STATUS: status,
+            KEY_LAST_SYNC_TIME:   _now_iso(),
+            **extra,
+        })
+
+    def _handle_auth_expired(self) -> None:
+        LOGGER.warning("[GarminSync] Garmin token expired – starting re-authentication flow")
+        self._set_status(STATUS_ERROR)
+        self.entry.async_start_reauth(self.hass)
 
     # ── State-change listeners setup ──────────────────────────────────────────
 
@@ -175,20 +227,14 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
             )
             LOGGER.debug("[GarminSync] Listening to weight sensor: %s", weight_id)
 
-        abwheel_sync: bool = cfg.get(CONF_ABWHEEL_SYNC, False)
-        if abwheel_sync:
-            self._unsubs.append(
-                self.hass.bus.async_listen(
-                    "xiaomi_abwheel_workout_completed",
-                    self._handle_abwheel_event,
+        if cfg.get(CONF_ABWHEEL_SYNC, False):
+            for event_type in (
+                "xiaomi_abwheel_workout_completed",
+                "xiaomi_abwheel_offline_workout",
+            ):
+                self._unsubs.append(
+                    self.hass.bus.async_listen(event_type, self._handle_abwheel_event)
                 )
-            )
-            self._unsubs.append(
-                self.hass.bus.async_listen(
-                    "xiaomi_abwheel_offline_workout",
-                    self._handle_abwheel_event,
-                )
-            )
             LOGGER.debug("[GarminSync] Listening for Ab Wheel workout events")
 
     def teardown_listeners(self) -> None:
@@ -196,7 +242,7 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
             unsub()
         self._unsubs.clear()
 
-    # ── Hydration change handler ──────────────────────────────────────────────
+    # ── Hydration ─────────────────────────────────────────────────────────────
 
     @callback
     def _handle_hydration_change(self, event: Event) -> None:
@@ -212,71 +258,75 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
             )
             return
 
-        if ml > _MAX_DAILY_ML:
+        date_str: str = dt_util.as_local(new_state.last_changed).strftime("%Y-%m-%d")
+        self.hass.async_create_task(
+            self._sync_hydration(ml, date_str), eager_start=False
+        )
+
+    async def _sync_hydration(self, total_ml: float, date_str: str) -> bool:
+        """Push the increment for ``date_str``.  Returns True if something was pushed.
+
+        The delta is computed under a lock, after any in-flight upload has
+        finished and updated ``_sent_hydration``, so concurrent triggers can
+        never send the same millilitres twice.
+        """
+        if total_ml > _MAX_DAILY_ML:
             LOGGER.warning(
                 "[GarminSync] Hydration value %.0f mL exceeds sanity cap %d – skipping",
-                ml, _MAX_DAILY_ML,
+                total_ml, _MAX_DAILY_ML,
             )
-            return
+            return False
 
-        date_str: str = new_state.last_changed.astimezone().strftime("%Y-%m-%d")
-        already_sent: float = self._sent_hydration.get(date_str, 0.0)
-        delta = ml - already_sent
+        async with self._hydration_lock:
+            already_sent: float = self._sent_hydration.get(date_str, 0.0)
+            delta = total_ml - already_sent
+            if delta < 1:
+                LOGGER.debug(
+                    "[GarminSync] Hydration %s: no increment (%.0f mL, already sent %.0f mL)",
+                    date_str, total_ml, already_sent,
+                )
+                return False
 
-        if delta < 1:
-            LOGGER.debug(
-                "[GarminSync] Hydration %s: no increment (%.0f mL, already sent %.0f mL)",
-                date_str, ml, already_sent,
+            LOGGER.info(
+                "[GarminSync] Hydration %s: +%.0f mL (total %.0f, prev %.0f)",
+                date_str, delta, total_ml, already_sent,
             )
-            return
+            cfg = self.get_config()
+            try:
+                await async_upload_hydration(
+                    self.hass,
+                    cfg[CONF_GARMIN_EMAIL],
+                    cfg[CONF_GARMIN_PASSWORD],
+                    delta,
+                    date_str,
+                    prompt_mfa=None,
+                )
+            except GarminAuthExpiredError:
+                self._handle_auth_expired()
+                return False
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.error("[GarminSync] Hydration %s failed: %s", date_str, exc)
+                self._set_status(STATUS_ERROR)
+                return False
 
-        LOGGER.info(
-            "[GarminSync] Hydration %s: +%.0f mL (total %.0f, prev %.0f)",
-            date_str, delta, ml, already_sent,
-        )
-        self.hass.async_create_task(
-            self._push_hydration(ml, delta, date_str), eager_start=False
-        )
-
-    async def _push_hydration(self, total_ml: float, delta: float, date_str: str) -> None:
-        cfg = self.get_config()
-        try:
-            await async_upload_hydration(
-                self.hass,
-                cfg[CONF_GARMIN_EMAIL],
-                cfg[CONF_GARMIN_PASSWORD],
-                delta,
-                date_str,
-                prompt_mfa=None,
-            )
             self._sent_hydration[date_str] = total_ml
             await self.async_save_store()
-            self.async_set_updated_data({
-                **self.data,
-                KEY_LAST_SYNC_STATUS: STATUS_OK,
-                KEY_LAST_SYNC_TIME:   datetime.now().isoformat(timespec="seconds"),
-                KEY_LAST_SYNC_ML:     int(total_ml),
-            })
-            LOGGER.info("[GarminSync] Hydration %s: %.0f mL synced OK", date_str, total_ml)
-        except GarminAuthExpiredError:
-            LOGGER.warning(
-                "[GarminSync] Garmin token expired – starting re-authentication flow"
-            )
-            self.entry.async_start_reauth(self.hass)
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.error("[GarminSync] Hydration %s failed: %s", date_str, exc)
-            self.async_set_updated_data({
-                **self.data,
-                KEY_LAST_SYNC_STATUS: STATUS_ERROR,
-                KEY_LAST_SYNC_TIME:   datetime.now().isoformat(timespec="seconds"),
-            })
 
-    # ── Weight change handler ─────────────────────────────────────────────────
+        self._set_status(STATUS_OK, **{KEY_LAST_SYNC_ML: int(total_ml)})
+        LOGGER.info("[GarminSync] Hydration %s: %.0f mL synced OK", date_str, total_ml)
+        return True
+
+    # ── Weight ────────────────────────────────────────────────────────────────
 
     @callback
     def _handle_weight_change(self, event: Event) -> None:
         new_state = event.data.get("new_state")
         if new_state is None:
+            return
+
+        old_state = event.data.get("old_state")
+        if old_state is not None and old_state.state == new_state.state:
+            # Attribute-only update – not a new reading
             return
 
         kg = _parse_positive_float(new_state.state)
@@ -287,45 +337,54 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
             )
             return
 
-        if not (_MIN_WEIGHT_KG <= kg <= _MAX_WEIGHT_KG):
+        self.hass.async_create_task(self._sync_weight(kg), eager_start=False)
+
+    async def _sync_weight(self, weight_kg: float) -> bool:
+        """Push a weigh-in unless it duplicates today's last pushed value."""
+        if not (_MIN_WEIGHT_KG <= weight_kg <= _MAX_WEIGHT_KG):
             LOGGER.warning(
                 "[GarminSync] Weight %.2f kg is outside valid range %.0f–%.0f kg – skipping",
-                kg, _MIN_WEIGHT_KG, _MAX_WEIGHT_KG,
+                weight_kg, _MIN_WEIGHT_KG, _MAX_WEIGHT_KG,
             )
-            return
+            return False
 
-        LOGGER.info("[GarminSync] Weight changed: %.2f kg – pushing to Garmin", kg)
-        self.hass.async_create_task(self._push_weight(kg), eager_start=False)
+        async with self._weight_lock:
+            today = dt_util.now().strftime("%Y-%m-%d")
+            last_kg = self._last_weight.get("kg")
+            if (
+                isinstance(last_kg, (int, float))
+                and self._last_weight.get("date") == today
+                and abs(last_kg - weight_kg) < _WEIGHT_EPSILON_KG
+            ):
+                LOGGER.debug(
+                    "[GarminSync] Weight %.2f kg already pushed today – skipping", weight_kg
+                )
+                return False
 
-    async def _push_weight(self, weight_kg: float) -> None:
-        cfg = self.get_config()
-        try:
-            await async_upload_weight(
-                self.hass,
-                cfg[CONF_GARMIN_EMAIL],
-                cfg[CONF_GARMIN_PASSWORD],
-                weight_kg,
-                prompt_mfa=None,
-            )
-            self.async_set_updated_data({
-                **self.data,
-                KEY_LAST_SYNC_STATUS:    STATUS_OK,
-                KEY_LAST_SYNC_TIME:      datetime.now().isoformat(timespec="seconds"),
-                KEY_LAST_SYNC_WEIGHT_KG: round(weight_kg, 2),
-            })
-            LOGGER.info("[GarminSync] Weight %.2f kg synced OK", weight_kg)
-        except GarminAuthExpiredError:
-            LOGGER.warning(
-                "[GarminSync] Garmin token expired – starting re-authentication flow"
-            )
-            self.entry.async_start_reauth(self.hass)
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.error("[GarminSync] Weight sync failed: %s", exc)
-            self.async_set_updated_data({
-                **self.data,
-                KEY_LAST_SYNC_STATUS: STATUS_ERROR,
-                KEY_LAST_SYNC_TIME:   datetime.now().isoformat(timespec="seconds"),
-            })
+            LOGGER.info("[GarminSync] Weight %.2f kg – pushing to Garmin", weight_kg)
+            cfg = self.get_config()
+            try:
+                await async_upload_weight(
+                    self.hass,
+                    cfg[CONF_GARMIN_EMAIL],
+                    cfg[CONF_GARMIN_PASSWORD],
+                    weight_kg,
+                    prompt_mfa=None,
+                )
+            except GarminAuthExpiredError:
+                self._handle_auth_expired()
+                return False
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.error("[GarminSync] Weight sync failed: %s", exc)
+                self._set_status(STATUS_ERROR)
+                return False
+
+            self._last_weight = {"kg": round(weight_kg, 2), "date": today}
+            await self._weight_store.async_save(self._last_weight)
+
+        self._set_status(STATUS_OK, **{KEY_LAST_SYNC_WEIGHT_KG: round(weight_kg, 2)})
+        LOGGER.info("[GarminSync] Weight %.2f kg synced OK", weight_kg)
+        return True
 
     # ── Ab Wheel event handler ─────────────────────────────────────────────────
 
@@ -333,21 +392,23 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
     def _handle_abwheel_event(self, event: Event) -> None:
         """Handle xiaomi_abwheel_workout_completed / xiaomi_abwheel_offline_workout events."""
         data = event.data
-        reps = int(data.get("reps", 0))
+        reps = _to_int(data.get("reps"))
         if reps < 1:
             return
 
-        start_time = str(data.get("start_time", ""))
+        start_time = str(data.get("start_time") or "").strip()
+        if not start_time:
+            # No start time → use the event time so the workout still gets a
+            # unique dedup key (and a sensible activity start time).
+            start_time = str(int(event.time_fired.timestamp()))
+
         # Dedup: skip if this workout was already synced
         if start_time in self._synced_workouts:
             LOGGER.debug("[GarminSync] Ab Wheel workout %s already synced – skipping", start_time)
             return
 
-        calories = int(data.get("calories", 0))
-        duration = int(data.get("duration", 0))
-        end_time = str(data.get("end_time", ""))
-        avg_freq = int(data.get("avg_freq", 0))
-        max_freq = int(data.get("max_freq", 0))
+        calories = _to_int(data.get("calories"))
+        duration = _to_int(data.get("duration"))
 
         LOGGER.info(
             "[GarminSync] Ab Wheel workout: %d reps, %d cal, %ds (start=%s) – pushing to Garmin",
@@ -355,7 +416,13 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
         )
         self.hass.async_create_task(
             self._push_abwheel_workout(
-                reps, calories, duration, start_time, end_time, avg_freq, max_freq
+                reps=reps,
+                calories=calories,
+                duration=duration,
+                start_time=start_time,
+                end_time=str(data.get("end_time") or ""),
+                avg_freq=_to_int(data.get("avg_freq")),
+                max_freq=_to_int(data.get("max_freq")),
             ),
             eager_start=False,
         )
@@ -378,51 +445,49 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
         self._pending_workouts.add(start_time)
         cfg = self.get_config()
         try:
-            result = await async_upload_abwheel_workout(
-                self.hass,
-                cfg[CONF_GARMIN_EMAIL],
-                cfg[CONF_GARMIN_PASSWORD],
-                reps=reps,
-                calories=calories,
-                duration_sec=duration,
-                start_time=start_time,
-                prompt_mfa=None,
-            )
+            try:
+                result = await async_upload_abwheel_workout(
+                    self.hass,
+                    cfg[CONF_GARMIN_EMAIL],
+                    cfg[CONF_GARMIN_PASSWORD],
+                    reps=reps,
+                    calories=calories,
+                    duration_sec=duration,
+                    start_time=start_time,
+                    prompt_mfa=None,
+                )
+            except GarminAuthExpiredError:
+                self._handle_auth_expired()
+                return
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.error("[GarminSync] Ab Wheel sync failed: %s", exc)
+                self._set_status(STATUS_ERROR)
+                return
+
             activity_id = result.get("activityId") if isinstance(result, dict) else None
 
-            # Mark as synced (dedup)
+            # Mark as synced (dedup) – upload succeeded, so do this before
+            # anything else that could fail.
             self._synced_workouts.add(start_time)
             await self._save_abwheel_store()
 
-            # Write to JSON history file (append, no duplicates)
-            await self.hass.async_add_executor_job(
-                self._append_abwheel_history,
-                start_time, end_time, reps, calories, duration,
-                avg_freq, max_freq, activity_id,
-            )
+            # Write to JSON history file (append, no duplicates).  A failure
+            # here must not flag the (successful) upload as an error.
+            try:
+                await self.hass.async_add_executor_job(
+                    self._append_abwheel_history,
+                    start_time, end_time, reps, calories, duration,
+                    avg_freq, max_freq, activity_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning("[GarminSync] Could not write Ab Wheel history: %s", exc)
 
             summary = f"{reps} reps, {calories} cal, {duration}s"
-            now_iso = datetime.now().isoformat(timespec="seconds")
-            self.async_set_updated_data({
-                **self.data,
-                KEY_LAST_SYNC_STATUS:  STATUS_OK,
-                KEY_LAST_SYNC_TIME:    now_iso,
-                KEY_LAST_SYNC_ABWHEEL: summary,
-            })
+            self._set_status(STATUS_OK, **{KEY_LAST_SYNC_ABWHEEL: summary})
             LOGGER.info(
                 "[GarminSync] Ab Wheel workout synced OK: %s (activity %s)",
                 summary, activity_id,
             )
-        except GarminAuthExpiredError:
-            LOGGER.warning("[GarminSync] Garmin token expired – starting re-authentication flow")
-            self.entry.async_start_reauth(self.hass)
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.error("[GarminSync] Ab Wheel sync failed: %s", exc)
-            self.async_set_updated_data({
-                **self.data,
-                KEY_LAST_SYNC_STATUS: STATUS_ERROR,
-                KEY_LAST_SYNC_TIME:   datetime.now().isoformat(timespec="seconds"),
-            })
         finally:
             self._pending_workouts.discard(start_time)
 
@@ -438,16 +503,12 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
         activity_id: str | None,
     ) -> None:
         """Append a workout record to the JSON history file (blocking, runs in executor)."""
-        from datetime import datetime as _dt
-
-        # Parse training date from start_time
-        try:
-            start_ts = int(float(start_time))
-            training_dt = _dt.fromtimestamp(start_ts)
+        training_dt = parse_workout_start(start_time, dt_util.get_default_time_zone())
+        if training_dt is not None:
             training_date = training_dt.strftime("%Y-%m-%d")
             training_time = training_dt.strftime("%H:%M:%S")
-        except (ValueError, OSError, TypeError):
-            training_date = _dt.now().strftime("%Y-%m-%d")
+        else:
+            training_date = dt_util.now().strftime("%Y-%m-%d")
             training_time = ""
 
         record = {
@@ -461,7 +522,7 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
             "avg_freq": avg_freq,
             "max_freq": max_freq,
             "garmin_activity_id": activity_id,
-            "synced_at": _dt.now().isoformat(timespec="seconds"),
+            "synced_at": _now_iso(),
         }
 
         # Load existing history, check for duplicate, append
@@ -469,12 +530,14 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
         if os.path.exists(self._abwheel_history_path):
             try:
                 with open(self._abwheel_history_path, "r", encoding="utf-8") as f:
-                    history = json.load(f)
+                    loaded = json.load(f)
+                if isinstance(loaded, list):
+                    history = loaded
             except (json.JSONDecodeError, OSError):
                 history = []
 
         # Don't duplicate: check by start_time
-        existing_keys = {str(r.get("start_time")) for r in history}
+        existing_keys = {str(r.get("start_time")) for r in history if isinstance(r, dict)}
         if start_time in existing_keys:
             return
 
@@ -497,11 +560,13 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
                 raw = await self.hass.async_add_executor_job(self._read_json_file, path)
                 if not isinstance(raw, list):
                     continue
-                for entry in raw:
-                    st = str(entry.get("start_time", ""))
+                for item in raw:
+                    if not isinstance(item, dict):
+                        continue
+                    st = str(item.get("start_time") or "").strip()
                     if not st or st in self._synced_workouts:
                         continue
-                    reps = int(entry.get("reps", 0))
+                    reps = _to_int(item.get("reps"))
                     if reps < 1:
                         continue
                     LOGGER.info(
@@ -510,49 +575,42 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
                     )
                     await self._push_abwheel_workout(
                         reps=reps,
-                        calories=int(entry.get("calories", 0)),
-                        duration=int(entry.get("duration_sec", entry.get("duration", 0))),
+                        calories=_to_int(item.get("calories")),
+                        duration=_to_int(item.get("duration_sec", item.get("duration"))),
                         start_time=st,
-                        end_time=str(entry.get("end_time", "")),
-                        avg_freq=int(entry.get("avg_freq", 0)),
-                        max_freq=int(entry.get("max_freq", 0)),
+                        end_time=str(item.get("end_time") or ""),
+                        avg_freq=_to_int(item.get("avg_freq")),
+                        max_freq=_to_int(item.get("max_freq")),
                     )
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("[GarminSync] Error reading journal %s: %s", path, exc)
 
     @staticmethod
-    def _read_json_file(path: str) -> list:
+    def _read_json_file(path: str) -> Any:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
 
     # ── Manual sync (sync_now service / button) ───────────────────────────────
 
     async def async_sync_now(self) -> None:
-        """Push current sensor values to Garmin immediately."""
+        """Push current sensor values to Garmin immediately (skipping duplicates)."""
         cfg = self.get_config()
         pushed_any = False
 
-        # Hydration
         water_id: str | None = cfg.get(CONF_WATER_SENSOR)
         if water_id:
             state = self.hass.states.get(water_id)
             ml = _parse_positive_float(state.state if state else None)
-            if ml and ml <= _MAX_DAILY_ML:
-                date_str = datetime.now().strftime("%Y-%m-%d")
-                already_sent = self._sent_hydration.get(date_str, 0.0)
-                delta = ml - already_sent
-                if delta >= 1:
-                    await self._push_hydration(ml, delta, date_str)
-                    pushed_any = True
+            if ml is not None:
+                date_str = dt_util.now().strftime("%Y-%m-%d")
+                pushed_any |= await self._sync_hydration(ml, date_str)
 
-        # Weight
         weight_id: str | None = cfg.get(CONF_WEIGHT_SENSOR)
         if weight_id:
             state = self.hass.states.get(weight_id)
             kg = _parse_positive_float(state.state if state else None)
-            if kg and _MIN_WEIGHT_KG <= kg <= _MAX_WEIGHT_KG:
-                await self._push_weight(kg)
-                pushed_any = True
+            if kg is not None:
+                pushed_any |= await self._sync_weight(kg)
 
         if not pushed_any:
             LOGGER.info("[GarminSync] sync_now: nothing to push (sensors unavailable or no change)")
@@ -560,7 +618,7 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
     # ── DataUpdateCoordinator override ───────────────────────────────────────
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Not used for polling; called once on startup to seed sensor state."""
+        """Not used for polling; data is pushed via async_set_updated_data()."""
         return self.data
 
 
@@ -573,22 +631,34 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Seed coordinator data so sensors show "never" immediately on load
     coordinator.async_set_updated_data(coordinator.data)
 
-    coordinator.setup_listeners()
-
-    # Retry any failed Ab Wheel uploads from the journal
-    hass.async_create_task(
-        coordinator.async_retry_abwheel_from_journal(), eager_start=False,
-    )
-
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
+    coordinator.setup_listeners()
+    entry.async_on_unload(coordinator.teardown_listeners)
+
+    # Retry any failed Ab Wheel uploads from the journal (cancelled on unload)
+    entry.async_create_background_task(
+        hass,
+        coordinator.async_retry_abwheel_from_journal(),
+        f"{DOMAIN}_abwheel_journal_retry_{entry.entry_id}",
+    )
+
     async def _handle_sync_now(call: ServiceCall) -> None:
+        # Always look coordinators up at call time – never capture one in the
+        # closure, or a reloaded entry would leave the service pointing at a
+        # stale, torn-down coordinator.
+        coordinators: dict[str, GarminSyncCoordinator] = hass.data.get(DOMAIN, {})
         entry_id: str | None = call.data.get("entry_id")
-        coord: GarminSyncCoordinator | None = (
-            hass.data[DOMAIN].get(entry_id) if entry_id else coordinator
-        )
-        if coord:
+        if entry_id:
+            coord = coordinators.get(entry_id)
+            if coord is None:
+                LOGGER.warning("[GarminSync] sync_now: unknown entry_id %s", entry_id)
+                return
+            targets = [coord]
+        else:
+            targets = list(coordinators.values())
+        for coord in targets:
             await coord.async_sync_now()
 
     if not hass.services.has_service(DOMAIN, SERVICE_SYNC_NOW):
@@ -608,8 +678,7 @@ async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> Non
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        coord: GarminSyncCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
-        coord.teardown_listeners()
+        hass.data[DOMAIN].pop(entry.entry_id, None)
         if not hass.data[DOMAIN]:
             hass.services.async_remove(DOMAIN, SERVICE_SYNC_NOW)
     return unload_ok

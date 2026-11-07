@@ -32,7 +32,8 @@
             "entity_not_found": "The selected sensor entity was not found.",
             "no_sensors": "Select at least one sensor to sync.",
             "cannot_connect": "Could not connect to Garmin Connect. Check your e-mail/password and try again.",
-            "invalid_mfa_code": "The verification code was incorrect or timed out. Please try again."
+            "invalid_mfa_code": "The verification code was incorrect. Please try again.",
+            "invalid_mfa_code_resent": "The verification code was incorrect or expired. Garmin has sent a new code – enter the new one below."
         },
         "abort": {
             "already_configured": "This Garmin account is already configured.",
@@ -44,22 +45,23 @@
         "step": {
             "init": {
                 "title": "Garmin Sync – Options",
-                "description": "Update the sensors to sync. To change your Garmin password, remove and re-add the integration.",
+                "description": "Update the sensors to sync. Clear a field to stop syncing it. If your Garmin session expires you will be prompted to re-authenticate.",
                 "data": {
-                    "water_sensor_entity": "Water intake sensor (mL today)",
+                    "water_sensor_entity": "Water intake sensor (mL today) – optional",
                     "weight_sensor_entity": "Body weight sensor (kg) – optional",
                     "abwheel_sync": "Sync Ab Wheel workouts to Garmin"
                 }
             }
         },
         "error": {
-            "entity_not_found": "The selected sensor entity was not found."
+            "entity_not_found": "The selected sensor entity was not found.",
+            "no_sensors": "Select at least one sensor to sync."
         }
     },
     "services": {
         "sync_now": {
             "name": "Sync to Garmin now",
-            "description": "Immediately pushes the current hydration and weight sensor values to Garmin Connect.",
+            "description": "Immediately pushes the current hydration and weight sensor values to Garmin Connect (values already synced are skipped). Without entry_id, all configured accounts are synced.",
             "fields": {
                 "entry_id": {
                     "name": "Config entry ID",

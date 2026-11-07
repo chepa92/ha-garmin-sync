@@ -39,7 +39,6 @@ class GarminSyncButton(ButtonEntity):
             name=f"Garmin Hydration Sync ({email})",
             manufacturer="Garmin",
             model="Connect API",
-            entry_type=None,
         )
 
     async def async_press(self) -> None:
