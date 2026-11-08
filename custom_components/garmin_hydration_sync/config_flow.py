@@ -18,6 +18,7 @@ from .const import (
     CONF_WATER_SENSOR,
     CONF_WEIGHT_SENSOR,
     CONF_ABWHEEL_SYNC,
+    CONF_JUMPROPE_SYNC,
     DOMAIN,
     LOGGER,
 )
@@ -67,6 +68,10 @@ def _user_schema(defaults: dict[str, Any]) -> vol.Schema:
                 CONF_ABWHEEL_SYNC,
                 default=defaults.get(CONF_ABWHEEL_SYNC, False),
             ): selector.BooleanSelector(),
+            vol.Optional(
+                CONF_JUMPROPE_SYNC,
+                default=defaults.get(CONF_JUMPROPE_SYNC, False),
+            ): selector.BooleanSelector(),
         }
     )
 
@@ -101,6 +106,10 @@ def _options_schema(defaults: dict[str, Any]) -> vol.Schema:
                 CONF_ABWHEEL_SYNC,
                 default=bool(defaults.get(CONF_ABWHEEL_SYNC, False)),
             ): selector.BooleanSelector(),
+            vol.Optional(
+                CONF_JUMPROPE_SYNC,
+                default=bool(defaults.get(CONF_JUMPROPE_SYNC, False)),
+            ): selector.BooleanSelector(),
         }
     )
 
@@ -110,6 +119,7 @@ def _has_any_source(user_input: dict[str, Any]) -> bool:
         user_input.get(CONF_WATER_SENSOR),
         user_input.get(CONF_WEIGHT_SENSOR),
         user_input.get(CONF_ABWHEEL_SYNC, False),
+        user_input.get(CONF_JUMPROPE_SYNC, False),
     ])
 
 
@@ -319,6 +329,8 @@ class GarminHydrationSyncConfigFlow(ConfigFlow, domain=DOMAIN):
                 data[k] = v
         if self._stored_input.get(CONF_ABWHEEL_SYNC, False):
             data[CONF_ABWHEEL_SYNC] = True
+        if self._stored_input.get(CONF_JUMPROPE_SYNC, False):
+            data[CONF_JUMPROPE_SYNC] = True
         return self.async_create_entry(title=f"Garmin – {email}", data=data)
 
     def _finish_reauth(self) -> FlowResult:
@@ -409,6 +421,7 @@ class GarminHydrationSyncOptionsFlow(OptionsFlow):
                     CONF_WATER_SENSOR: user_input.get(CONF_WATER_SENSOR) or None,
                     CONF_WEIGHT_SENSOR: user_input.get(CONF_WEIGHT_SENSOR) or None,
                     CONF_ABWHEEL_SYNC: bool(user_input.get(CONF_ABWHEEL_SYNC, False)),
+                    CONF_JUMPROPE_SYNC: bool(user_input.get(CONF_JUMPROPE_SYNC, False)),
                 }
                 return self.async_create_entry(title="", data=out)
             current = {**current, **user_input}

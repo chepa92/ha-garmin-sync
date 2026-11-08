@@ -10,6 +10,8 @@ No schedules, no polling — syncs are triggered in real time by sensor state-ch
 
 ## Features
 
+- **Jump Rope sync** — each finished workout of the [Xiaomi Smart Jump Rope](https://github.com/chepa92/ha-xiaomi-jump-rope) becomes one Garmin *Jump Rope* activity (start time, duration, calories, jump count in the title); duplicates are skipped by start time
+
 - **Hydration sync** — tracks daily mL totals and sends only the increment since the last push, preserving any manual entries in the Garmin app
 - **Weight sync** — each new weigh-in is uploaded as an independent entry to Garmin's scale history
 - **Event-driven** — syncs fire immediately when a sensor changes, not on a timer
@@ -52,6 +54,18 @@ Copy the `custom_components/garmin_hydration_sync/` folder into your HA `config/
 
 ---
 
+## Jump Rope
+
+Enable **Sync Jump Rope sessions to Garmin** in the setup form or in the integration's options. It needs the
+[ha-xiaomi-jump-rope](https://github.com/chepa92/ha-xiaomi-jump-rope) integration, which fires one
+`xiaomi_jump_rope_session_completed` event per workout stored on the rope.
+
+* One Garmin activity (type *Jump Rope*) per workout, never per jump: start time, duration, calories, and the jump count in the title.
+* Already-uploaded workouts are remembered by start time, so repeating an upload is harmless.
+* To **backfill** workouts already stored on the rope, press **Resend stored workouts** on the jump rope device.
+
+---
+
 ## Entities
 
 | Entity | Type | Description |
@@ -60,6 +74,7 @@ Copy the `custom_components/garmin_hydration_sync/` folder into your HA `config/
 | `sensor.garmin_last_synced_water` | Sensor | Last synced daily water total (mL) |
 | `sensor.garmin_last_synced_weight` | Sensor | Last synced body weight (kg) |
 | `button.garmin_sync_to_garmin` | Button | Trigger an immediate manual sync |
+| `sensor.garmin_last_synced_jump_rope_session` | Sensor | Last Jump Rope workout pushed to Garmin |
 
 ---
 

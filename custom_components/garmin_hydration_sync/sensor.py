@@ -19,6 +19,7 @@ from .const import (
     KEY_LAST_SYNC_TIME,
     KEY_LAST_SYNC_WEIGHT_KG,
     KEY_LAST_SYNC_ABWHEEL,
+    KEY_LAST_SYNC_JUMPROPE,
 )
 from . import GarminSyncCoordinator
 
@@ -34,6 +35,7 @@ async def async_setup_entry(
         GarminLastSyncMlSensor(coordinator, entry),
         GarminLastSyncWeightSensor(coordinator, entry),
         GarminLastSyncAbWheelSensor(coordinator, entry),
+        GarminLastSyncJumpRopeSensor(coordinator, entry),
     ]
     async_add_entities(entities)
 
@@ -132,3 +134,21 @@ class GarminLastSyncAbWheelSensor(_GarminSensorBase):
         return {
             "last_sync_time": data.get(KEY_LAST_SYNC_TIME),
         }
+
+
+
+class GarminLastSyncJumpRopeSensor(_GarminSensorBase):
+    """Shows the last Jump Rope session summary pushed to Garmin."""
+
+    _attr_icon = "mdi:jump-rope"
+    _attr_name = "Last Synced Jump Rope Session"
+
+    def __init__(
+        self, coordinator: GarminSyncCoordinator, entry: ConfigEntry
+    ) -> None:
+        super().__init__(coordinator, entry, KEY_LAST_SYNC_JUMPROPE, "last_sync_jumprope")
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        data = self.coordinator.data or {}
+        return {"last_sync_time": data.get(KEY_LAST_SYNC_TIME)}

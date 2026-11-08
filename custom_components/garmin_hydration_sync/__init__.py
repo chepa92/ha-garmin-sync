@@ -52,6 +52,7 @@ from .const import (
     CONF_WATER_SENSOR,
     CONF_WEIGHT_SENSOR,
     CONF_ABWHEEL_SYNC,
+    CONF_JUMPROPE_SYNC,
     DOMAIN,
     KEY_LAST_SYNC_DAYS,
     KEY_LAST_SYNC_FAILED,
@@ -60,6 +61,7 @@ from .const import (
     KEY_LAST_SYNC_TIME,
     KEY_LAST_SYNC_WEIGHT_KG,
     KEY_LAST_SYNC_ABWHEEL,
+    KEY_LAST_SYNC_JUMPROPE,
     LOGGER,
     SERVICE_SYNC_NOW,
     STATUS_ERROR,
@@ -139,6 +141,7 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
             KEY_LAST_SYNC_DAYS:      None,
             KEY_LAST_SYNC_FAILED:    None,
             KEY_LAST_SYNC_ABWHEEL:   None,
+            KEY_LAST_SYNC_JUMPROPE:  None,
         }
         # Persistent store: {"YYYY-MM-DD": mL_already_sent_to_Garmin}
         self._store: Store = Store(hass, _STORE_VERSION, f"{DOMAIN}.{entry.entry_id}.sent")
@@ -154,6 +157,10 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
         self._pending_workouts: set[str] = set()  # in-flight uploads (race guard)
         # JSON history file path
         self._abwheel_history_path: str = hass.config.path(f"{DOMAIN}_abwheel_history.json")
+        # Persistent set of synced jump-rope session start_times (dedup key)
+        self._jumprope_store: Store = Store(hass, _STORE_VERSION, f"{DOMAIN}.{entry.entry_id}.jumprope")
+        self._synced_jumprope: set[str] = set()
+        self._pending_jumprope: set[str] = set()
         self._unsubs: list[Any] = []
 
     # ── Persistence ──────────────────────────────────────────────────────────
@@ -236,6 +243,15 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
                     self.hass.bus.async_listen(event_type, self._handle_abwheel_event)
                 )
             LOGGER.debug("[GarminSync] Listening for Ab Wheel workout events")
+
+        if cfg.get(CONF_JUMPROPE_SYNC, False):
+            self._unsubs.append(
+                self.hass.bus.async_listen(
+                    "xiaomi_jump_rope_session_completed",
+                    self._handle_jumprope_event,
+                )
+            )
+            LOGGER.debug("[GarminSync] Listening for Jump Rope session events")
 
     def teardown_listeners(self) -> None:
         for unsub in self._unsubs:
@@ -545,6 +561,68 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
         with open(self._abwheel_history_path, "w", encoding="utf-8") as f:
             json.dump(history, f, indent=2, ensure_ascii=False)
         LOGGER.debug("[GarminSync] Wrote abwheel history: %s", self._abwheel_history_path)
+
+    # ── Jump Rope session handler ──────────────────────────────────────────────
+
+    @callback
+    def _handle_jumprope_event(self, event: Event) -> None:
+        """Handle xiaomi_jump_rope_session_completed (one event per finished session)."""
+        data = event.data
+        jumps = int(data.get("jumps", 0))
+        if jumps < 1:
+            return
+        start_time = str(data.get("start_time", ""))
+        if not start_time or start_time in self._synced_jumprope:
+            LOGGER.debug("[GarminSync] Jump Rope session %s already synced/invalid - skipping", start_time)
+            return
+        calories = int(data.get("calories", 0))
+        duration = int(data.get("duration", 0))
+        LOGGER.info(
+            "[GarminSync] Jump Rope session: %d jumps, %d cal, %ds (start=%s) - pushing to Garmin",
+            jumps, calories, duration, start_time,
+        )
+        self.hass.async_create_task(
+            self._push_jumprope_session(jumps, calories, duration, start_time),
+            eager_start=False,
+        )
+
+    async def _push_jumprope_session(
+        self, jumps: int, calories: int, duration: int, start_time: str
+    ) -> None:
+        """Upload one finished jump rope workout (deduplicated by start time)."""
+        if start_time in self._synced_jumprope or start_time in self._pending_jumprope:
+            return
+        self._pending_jumprope.add(start_time)
+        cfg = self.get_config()
+        try:
+            try:
+                await async_upload_jumprope_workout(
+                    self.hass,
+                    cfg[CONF_GARMIN_EMAIL],
+                    cfg[CONF_GARMIN_PASSWORD],
+                    jumps=jumps,
+                    calories=calories,
+                    duration_sec=duration,
+                    start_time=start_time,
+                    prompt_mfa=None,
+                )
+            except GarminAuthExpiredError:
+                self._handle_auth_expired()
+                return
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.error("[GarminSync] Jump Rope sync failed: %s", exc)
+                self._set_status(STATUS_ERROR)
+                return
+
+            # Mark as synced right after the upload succeeded (dedup).
+            self._synced_jumprope.add(start_time)
+            await self._save_jumprope_store()
+
+            summary = f"{jumps} jumps, {calories} cal, {duration}s"
+            self._set_status(STATUS_OK, **{KEY_LAST_SYNC_JUMPROPE: summary})
+            LOGGER.info("[GarminSync] Jump Rope session synced OK: %s", summary)
+        finally:
+            self._pending_jumprope.discard(start_time)
 
     # ── Retry failed Ab Wheel uploads from journal ─────────────────────────
 

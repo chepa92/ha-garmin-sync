@@ -10,7 +10,8 @@
                     "garmin_password": "Garmin Connect password",
                     "water_sensor_entity": "Water intake sensor (mL today) – optional",
                     "weight_sensor_entity": "Body weight sensor (kg) – optional",
-                    "abwheel_sync": "Sync Ab Wheel workouts to Garmin"
+                    "abwheel_sync": "Sync Ab Wheel workouts to Garmin",
+                    "jumprope_sync": "Sync Jump Rope sessions to Garmin (one activity per session)"
                 }
             },
             "mfa": {
@@ -49,7 +50,8 @@
                 "data": {
                     "water_sensor_entity": "Water intake sensor (mL today) – optional",
                     "weight_sensor_entity": "Body weight sensor (kg) – optional",
-                    "abwheel_sync": "Sync Ab Wheel workouts to Garmin"
+                    "abwheel_sync": "Sync Ab Wheel workouts to Garmin",
+                    "jumprope_sync": "Sync Jump Rope sessions to Garmin (one activity per session)"
                 }
             }
         },

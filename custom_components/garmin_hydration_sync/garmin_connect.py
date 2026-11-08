@@ -317,3 +317,67 @@ async def async_upload_abwheel_workout(
     return await hass.async_add_executor_job(
         _run_with_client, token_dir, email, password, prompt_mfa, _action
     )
+
+
+# ── Jump Rope workout upload ─────────────────────────────────────────────────
+
+async def async_upload_jumprope_workout(
+    hass: HomeAssistant,
+    email: str,
+    password: str,
+    jumps: int,
+    calories: int,
+    duration_sec: int,
+    start_time: str,
+    prompt_mfa: Callable[[], str] | None = None,
+) -> dict[str, Any]:
+    """Create a jump_rope activity on Garmin Connect for one finished workout."""
+    token_dir = hass.config.path(TOKEN_SUBDIR)
+    tz_name: str = hass.config.time_zone or "UTC"
+    tz = await hass.async_add_executor_job(ZoneInfo, tz_name)
+
+    start_dt = parse_workout_start(start_time, tz)
+    if start_dt is None:
+        LOGGER.warning(
+            "[GarminSync] Could not parse Jump Rope start_time %r – using now", start_time
+        )
+        start_dt = datetime.now(tz)
+
+    duration = max(int(duration_sec), 60)
+    payload: dict[str, Any] = {
+        "activityTypeDTO": {"typeKey": "jump_rope"},
+        "accessControlRuleDTO": {"typeId": 2, "typeKey": "private"},
+        "timeZoneUnitDTO": {"unitKey": tz_name},
+        "activityName": f"Jump Rope – {jumps} jumps",
+        "metadataDTO": {"autoCalcCalories": calories <= 0},
+        "summaryDTO": {
+            "startTimeLocal": start_dt.strftime("%Y-%m-%dT%H:%M:%S.000"),
+            "distance": 0,
+            "duration": duration,
+        },
+    }
+    if calories > 0:
+        payload["summaryDTO"]["calories"] = calories
+
+    def _action(client: Any) -> Any:
+        LOGGER.info(
+            "[GarminSync] Uploading Jump Rope workout: %d jumps, %d cal, %ds at %s (%s)",
+            jumps, calories, duration_sec, start_dt.strftime("%Y-%m-%d %H:%M"), tz_name,
+        )
+        if hasattr(client, "create_manual_activity_from_json"):
+            result = client.create_manual_activity_from_json(payload)
+        else:  # older garminconnect: minutes only, no calories
+            result = client.create_manual_activity(
+                start_datetime=payload["summaryDTO"]["startTimeLocal"],
+                time_zone=tz_name,
+                type_key="jump_rope",
+                distance_km=0,
+                duration_min=max(round(duration / 60), 1),
+                activity_name=payload["activityName"],
+            )
+        LOGGER.debug("[GarminSync] Jump Rope upload result: %s", result)
+        return result
+
+    return await hass.async_add_executor_job(
+        _run_with_client, token_dir, email, password, prompt_mfa, _action
+    )

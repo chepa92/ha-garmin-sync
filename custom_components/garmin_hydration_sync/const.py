@@ -14,6 +14,8 @@ CONF_WATER_SENSOR    = "water_sensor_entity"
 CONF_WEIGHT_SENSOR   = "weight_sensor_entity"
 # Sync Ab Wheel workouts to Garmin (listens for xiaomi_abwheel HA bus events)
 CONF_ABWHEEL_SYNC    = "abwheel_sync"
+# Sync Jump Rope sessions to Garmin (listens for xiaomi_jump_rope session events)
+CONF_JUMPROPE_SYNC   = "jumprope_sync"
 
 # ── Services ─────────────────────────────────────────────────────────────────
 SERVICE_SYNC_NOW = "sync_now"
@@ -29,6 +31,7 @@ KEY_LAST_SYNC_WEIGHT_KG  = "last_sync_weight_kg"
 KEY_LAST_SYNC_DAYS       = "last_sync_days"
 KEY_LAST_SYNC_FAILED     = "last_sync_failed"
 KEY_LAST_SYNC_ABWHEEL    = "last_sync_abwheel"
+KEY_LAST_SYNC_JUMPROPE   = "last_sync_jumprope"
 
 STATUS_OK    = "ok"
 STATUS_ERROR = "error"
