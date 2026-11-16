@@ -420,8 +420,11 @@ async def async_fetch_health_days(
                 except Exception as exc:  # noqa: BLE001 - one missing metric must not lose the day
                     LOGGER.debug("[GarminSync] %s for %s unavailable: %s", name, date_str, exc)
                     payload[name] = None
+                    # A failed call (rate limit, network) is not the same as "no data":
+                    # the caller keeps the day open and asks again later.
+                    payload.setdefault("errors", []).append(name)
             days[date_str] = payload
-            time.sleep(0.2)  # stay well under Garmin's rate limit during a backfill
+            time.sleep(0.5)  # stay well under Garmin's rate limit during a backfill
         return {"days": days}
 
     return await hass.async_add_executor_job(

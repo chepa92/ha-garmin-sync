@@ -61,6 +61,14 @@ def _timestamp(value: datetime | None) -> float:
     return value.timestamp()
 
 
+def _needs_retry(record: dict[str, Any]) -> bool:
+    """A day whose download failed part-way. Records saved by 1.4.0 carry no flag, so a
+    night-less one is checked once more (it may have hit Garmin's rate limit)."""
+    if "incomplete" in record:
+        return bool(record["incomplete"])
+    return not record_has_night(record)
+
+
 class MigraineForecastManager:
     """Owns the stored days + headache log of one Garmin account."""
 
@@ -128,6 +136,7 @@ class MigraineForecastManager:
                 or offset <= _RECHECK_DAYS
                 or record.get("fetched_on", "") <= date_str
                 or "migraine_log" not in record
+                or _needs_retry(record)
             ):
                 dates.append(date_str)
         return dates
@@ -135,7 +144,12 @@ class MigraineForecastManager:
     async def async_refresh(self, backfill_days: int | None = None) -> None:
         """Download missing / unfinished days and recompute the forecast."""
         async with self._lock:
-            stale = any("migraine_log" not in record for record in self._records.values())
+            # Days from before the lifestyle log was read, or whose download failed
+            # part-way (Garmin rate limit), are picked up again across the whole window.
+            stale = any(
+                "migraine_log" not in record or _needs_retry(record)
+                for record in self._records.values()
+            )
             days = backfill_days if backfill_days is not None else (
                 _BACKFILL_DAYS if not self._records or stale else _RECHECK_DAYS
             )
@@ -144,6 +158,7 @@ class MigraineForecastManager:
             cfg = self._coordinator.get_config()
             today_str = dt_util.now().strftime("%Y-%m-%d")
             self.last_error = None
+            failed = 0
             try:
                 for start in range(0, len(dates), _BATCH_DAYS):
                     batch = dates[start:start + _BATCH_DAYS]
@@ -158,6 +173,15 @@ class MigraineForecastManager:
                             payload.get("lifestyle"),
                         )
                         record["fetched_on"] = today_str
+                        errors = payload.get("errors") or []
+                        record["incomplete"] = bool(errors)
+                        if errors:
+                            failed += 1
+                            previous = self._records.get(date_str)
+                            # Never replace a night we already have with a failed download.
+                            if record_has_night(previous) and not record_has_night(record):
+                                previous["incomplete"] = True
+                                continue
                         self._records[date_str] = record
                     await self._save()
             except GarminAuthExpiredError:
@@ -166,6 +190,12 @@ class MigraineForecastManager:
             except Exception as exc:  # noqa: BLE001
                 self.last_error = str(exc)
                 LOGGER.error("[GarminSync] Migraine forecast refresh failed: %s", exc)
+            if failed and self.last_error is None:
+                self.last_error = f"{failed} day(s) only partly downloaded - will retry"
+                LOGGER.warning(
+                    "[GarminSync] Migraine forecast: %d day(s) only partly downloaded "
+                    "(Garmin rate limit?) - they are retried on the next refresh", failed,
+                )
             self.last_refresh = dt_util.utcnow().isoformat()
             self._recompute()
 
@@ -186,6 +216,14 @@ class MigraineForecastManager:
         """Manual log plus the days answered "Migraines: yes" in Garmin Lifestyle Logging."""
         from_log = headaches_from_daily_log(self._records, self._day_start, self._default_anchor)
         return merge_headaches(self.headaches, from_log, dt_util.utcnow().timestamp())
+
+    @property
+    def days_incomplete(self) -> int:
+        return sum(1 for record in self._records.values() if _needs_retry(record))
+
+    @property
+    def days_without_sleep(self) -> int:
+        return sum(1 for record in self._records.values() if not record_has_night(record))
 
     @property
     def garmin_migraine_days(self) -> int:

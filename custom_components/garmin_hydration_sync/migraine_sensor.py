@@ -82,6 +82,8 @@ class MigraineStatusSensor(_MigraineSensor):
             "horizon_hours": HORIZON_HOURS,
             "alert_percentile": ALERT_PERCENTILE,
             "nights_stored": manager.nights_stored,
+            "days_without_sleep": manager.days_without_sleep,
+            "days_incomplete": manager.days_incomplete,
             "normal_days": result.get("normal_days"),
             "pre_headache_days": result.get("pre_headache_days"),
             "baseline_days_needed": MIN_BASELINE,
