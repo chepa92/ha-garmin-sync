@@ -92,6 +92,12 @@ How it works:
    reports how well the index separates them (AUC; 0.5 = not at all), how many headaches were preceded by an
    `elevated` morning, false alerts per week and the typical lead time.
 
+6. **72-hour view** — the same check with a longer window: the most unusual of the last three mornings
+   (`index_3d`, `percentile_3d`, `elevated_3d` on the forecast sensor) against a headache within 72 h. The
+   accuracy sensor's `evaluation_72h` attribute counts it per attack: how many attacks had an alert in the
+   72 h before them (`attacks_alerted_pct`), next to how often three normal mornings contain an alert anyway
+   (`alerted_by_chance_pct`) — the first has to clearly beat the second to mean anything.
+
 | Entity | Description |
 |--------|-------------|
 | `sensor.…_migraine_forecast` | `no_data` / `collecting_baseline` / `usual` / `elevated`; attributes hold the summary, indices and the three measures that moved most |

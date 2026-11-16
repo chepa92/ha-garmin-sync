@@ -164,3 +164,36 @@ def test_manual_entry_replaces_overlapping_garmin_day():
     merged = m.merge_headaches(manual, from_log, anchor(date_of(30)))
     assert [h["id"] for h in merged] == ["a"]
     assert len(m.merge_headaches([], from_log, anchor(date_of(30)))) == 1
+
+
+def test_72h_view_catches_an_unusual_night_two_days_before():
+    records, headaches = {}, []
+    for i in range(140):
+        # The unusual night comes two mornings before each headache; the night right
+        # before it is ordinary, so the single-morning score cannot see it.
+        records[date_of(i)] = record(i, bad=(i > 30 and i % 14 == 0))
+        if i > 30 and i % 14 == 2:
+            onset = anchor(date_of(i)) + 6 * H
+            headaches.append({"onset": onset, "end": onset + 5 * H})
+    result = m.compute_forecast(records, headaches, anchor(date_of(150)), anchor)
+    by_date = {d["date"]: d for d in result["days"]}
+    morning = by_date[date_of(58)]  # headache day; the bad night was day 56
+    assert morning["label"] == "pre_headache" and not morning["alert"]
+    assert morning["label_72h"] == "pre_headache" and morning["alert_3d"]
+    assert by_date[date_of(56)]["label_72h"] == "pre_headache"
+
+    long_view = result["evaluation_72h"]
+    assert long_view is not None
+    assert long_view["attacks_alerted"] == long_view["attacks_with_data"] >= 5
+    assert long_view["alerted_by_chance_pct"] < 20
+    assert long_view["index_3d_auc"] > 0.9
+    # The single-morning view only sees the echo of that night (HRV change), not the night.
+    assert result["evaluation"]["headaches_alerted"] < long_view["attacks_alerted"]
+
+
+def test_72h_label_needs_a_longer_clear_period():
+    headaches = [{"onset": 100 * H, "end": 110 * H}]
+    now = 1000 * H
+    assert m.label_day(40 * H, headaches, now, 72) == "pre_headache"   # 60 h before
+    assert m.label_day(10 * H, headaches, now, 72) == "near_headache"  # 90 h before
+    assert m.label_day(10 * H, headaches, now) == "normal"             # fine on the 24 h view

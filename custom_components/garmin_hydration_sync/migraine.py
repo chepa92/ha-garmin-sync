@@ -26,6 +26,9 @@ from typing import Any, Callable
 HOUR = 3600.0
 
 HORIZON_HOURS = 24
+# Second, longer look: "were the last 3 mornings unusual" against a headache within 72 h.
+LONG_HORIZON_HOURS = 72
+LONG_WINDOW_DAYS = 3
 NORMAL_CLEAR_BEFORE_HOURS = 24
 NORMAL_CLEAR_AFTER_HOURS = 48
 # A headache with no recorded end counts as ongoing for at most this long.
@@ -249,17 +252,24 @@ def _headache_end(headache: dict[str, Any], now: float) -> float:
     return end if end is not None else min(now, headache["onset"] + MAX_OPEN_HEADACHE_HOURS * HOUR)
 
 
-def label_day(anchor: float, headaches: list[dict[str, Any]], now: float) -> str:
-    """Label the morning ``anchor`` by what happened afterwards."""
+def label_day(
+    anchor: float, headaches: list[dict[str, Any]], now: float, horizon_hours: float = HORIZON_HOURS,
+) -> str:
+    """Label the morning ``anchor`` by what happened afterwards.
+
+    ``horizon_hours`` is how far ahead a headache counts as "pre-headache"; a normal day
+    needs a further 24 h clear after that.
+    """
+    clear_after = horizon_hours + (NORMAL_CLEAR_AFTER_HOURS - HORIZON_HOURS)
     pre = after = near = False
     for headache in headaches:
         onset = headache["onset"]
         end = _headache_end(headache, now)
         if onset <= anchor <= end:
             return "during"
-        if anchor < onset <= anchor + HORIZON_HOURS * HOUR:
+        if anchor < onset <= anchor + horizon_hours * HOUR:
             pre = True
-        elif anchor < onset <= anchor + NORMAL_CLEAR_AFTER_HOURS * HOUR:
+        elif anchor < onset <= anchor + clear_after * HOUR:
             near = True
         if anchor - NORMAL_CLEAR_BEFORE_HOURS * HOUR <= end < anchor:
             after = True
@@ -269,7 +279,7 @@ def label_day(anchor: float, headaches: list[dict[str, Any]], now: float) -> str
         return "after"
     if near:
         return "near_headache"
-    return "normal" if now >= anchor + NORMAL_CLEAR_AFTER_HOURS * HOUR else "pending"
+    return "normal" if now >= anchor + clear_after * HOUR else "pending"
 
 
 def headaches_from_daily_log(
@@ -355,6 +365,10 @@ def compute_forecast(
             "alert": False,
             "top_features": [],
             "z": {},
+            "label_72h": label_day(anchor, headaches, now, LONG_HORIZON_HOURS),
+            "index_3d": None,
+            "percentile_3d": None,
+            "alert_3d": False,
         })
 
     for index, day in enumerate(days):
@@ -401,11 +415,98 @@ def compute_forecast(
             day["percentile"] = below / len(reference) * 100
             day["alert"] = day["percentile"] >= ALERT_PERCENTILE
 
+    _score_three_day_window(days)
+
     return {
         "days": days,
         "evaluation": _evaluate(days, headaches),
+        "evaluation_72h": _evaluate_72h(days, headaches),
         "normal_days": sum(1 for d in days if d["label"] == "normal"),
         "pre_headache_days": sum(1 for d in days if d["label"] == "pre_headache"),
+    }
+
+
+def _score_three_day_window(days: list[dict[str, Any]]) -> None:
+    """The 72-hour view: the most unusual of the last three mornings.
+
+    ``index_3d`` = highest deviation index of this morning and the two before it. Its
+    percentile is taken against earlier days that were normal on the 72-hour definition
+    and already settled, exactly like the single-morning score.
+    """
+    by_date = {day["date"]: day for day in days}
+    for day in days:
+        if day["deviation_index"] is None:
+            continue
+        window = [by_date.get(_previous_date(day["date"], step)) for step in range(LONG_WINDOW_DAYS)]
+        values = [d["deviation_index"] for d in window if d and d["deviation_index"] is not None]
+        if len(values) >= 2:
+            day["index_3d"] = max(values)
+
+    settle = (LONG_HORIZON_HOURS + NORMAL_CLEAR_AFTER_HOURS - HORIZON_HOURS) * HOUR
+    for index, day in enumerate(days):
+        if day["index_3d"] is None:
+            continue
+        known_by = day["anchor"] - settle
+        reference = [
+            d["index_3d"] for d in days[:index]
+            if d["anchor"] <= known_by and d["label_72h"] == "normal" and d["index_3d"] is not None
+        ][-BASELINE_WINDOW:]
+        if len(reference) >= MIN_PERCENTILE_REFERENCE:
+            below = sum(1 for value in reference if value < day["index_3d"])
+            day["percentile_3d"] = below / len(reference) * 100
+            day["alert_3d"] = day["percentile_3d"] >= ALERT_PERCENTILE
+
+
+def _evaluate_72h(days: list[dict[str, Any]], headaches: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Same question as ``_evaluate`` for the 72-hour view, counted per attack.
+
+    Mornings before one attack are not independent, so the headline is per attack: how
+    many had an alert in the 72 h before them, next to how often a 3-morning stretch of
+    normal days contains an alert anyway (the rate to beat).
+    """
+    judged = [d for d in days if d["percentile_3d"] is not None]
+    pre = [d for d in judged if d["label_72h"] == "pre_headache"]
+    normal = [d for d in judged if d["label_72h"] == "normal"]
+
+    with_data = alerted = 0
+    for headache in headaches:
+        onset = headache["onset"]
+        before = [d for d in judged if onset - LONG_HORIZON_HOURS * HOUR <= d["anchor"] < onset]
+        if not before:
+            continue
+        with_data += 1
+        if any(d["alert_3d"] for d in before):
+            alerted += 1
+    if with_data < MIN_PRE_HEADACHE or len(normal) < MIN_NORMAL:
+        return None
+
+    by_date = {day["date"]: day for day in days}
+    chance_hits = 0
+    for day in normal:
+        window = [by_date.get(_previous_date(day["date"], step)) for step in range(LONG_WINDOW_DAYS)]
+        if any(d and d["alert_3d"] for d in window):
+            chance_hits += 1
+
+    # Consecutive alert mornings come from the same unusual night: count them once.
+    episodes = 0
+    previous_alert = False
+    for day in judged:
+        is_false_alert = day["alert_3d"] and day["label_72h"] == "normal"
+        if is_false_alert and not previous_alert:
+            episodes += 1
+        previous_alert = day["alert_3d"]
+    span_weeks = (judged[-1]["anchor"] - judged[0]["anchor"]) / (7 * 24 * HOUR) if len(judged) > 1 else 0
+
+    return {
+        "horizon_hours": LONG_HORIZON_HOURS,
+        "attacks_with_data": with_data,
+        "attacks_alerted": alerted,
+        "attacks_alerted_pct": round(alerted / with_data * 100),
+        "alerted_by_chance_pct": round(chance_hits / len(normal) * 100),
+        "index_3d_auc": round(auc([d["index_3d"] for d in pre], [d["index_3d"] for d in normal]), 3) if pre else None,
+        "pre_headache_mornings": len(pre),
+        "normal_mornings": len(normal),
+        "false_alert_episodes_per_week": round(episodes / max(1.0, span_weeks), 2) if span_weeks > 0 else None,
     }
 
 

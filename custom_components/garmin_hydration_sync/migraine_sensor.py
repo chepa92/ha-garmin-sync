@@ -101,6 +101,10 @@ class MigraineStatusSensor(_MigraineSensor):
             "directional_index": _round(today["directional_index"]),
             "percentile": _round(today["percentile"], 0),
             "moved_most": today["top_features"],
+            # 72-hour view: the most unusual of the last three mornings.
+            "index_3d": _round(today["index_3d"]),
+            "percentile_3d": _round(today["percentile_3d"], 0),
+            "elevated_3d": today["alert_3d"],
         })
         if today["percentile"] is not None:
             attrs["summary"] = (
@@ -168,7 +172,7 @@ class MigraineEvaluationSensor(_MigraineSensor):
         result = self._manager.result or {}
         evaluation = result.get("evaluation")
         if evaluation:
-            return evaluation
+            return {**evaluation, "evaluation_72h": result.get("evaluation_72h")}
         # A day has a score only once enough earlier normal days exist to compare it with,
         # so mornings at the start of the downloaded history are labelled but not scored.
         days = result.get("days", [])
