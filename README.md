@@ -100,6 +100,7 @@ How it works:
 | `sensor.…_migraine_forecast_accuracy` | AUC once there is enough data; details as attributes |
 | `sensor.…_headache_log` | Number of logged headaches; recent ones (with ids) as an attribute |
 | `button.…_headache_started` / `…_headache_ended` | One-tap logging |
+| `button.…_resync_migraine_data` | Downloads the last 60 days from Garmin again and recomputes (runs in the background, 1–2 minutes) |
 
 Services: `log_headache`, `end_headache`, `delete_headache`, `refresh_migraine_forecast` (`backfill_days` up to 365).
 

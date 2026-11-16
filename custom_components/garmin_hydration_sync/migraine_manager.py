@@ -141,6 +141,14 @@ class MigraineForecastManager:
                 dates.append(date_str)
         return dates
 
+    @property
+    def refreshing(self) -> bool:
+        return self._lock.locked()
+
+    async def async_resync(self) -> None:
+        """Download the whole history window again (the Resync button)."""
+        await self.async_refresh(_BACKFILL_DAYS)
+
     async def async_refresh(self, backfill_days: int | None = None) -> None:
         """Download missing / unfinished days and recompute the forecast."""
         async with self._lock:

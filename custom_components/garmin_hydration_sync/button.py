@@ -23,8 +23,43 @@ async def async_setup_entry(
         entities += [
             HeadacheButton(coordinator, entry, "headache_start", "Headache Started", "mdi:head-alert-outline"),
             HeadacheButton(coordinator, entry, "headache_end", "Headache Ended", "mdi:head-check-outline"),
+            MigraineResyncButton(coordinator, entry),
         ]
     async_add_entities(entities)
+
+
+class MigraineResyncButton(ButtonEntity):
+    """Download the whole history window from Garmin again and recompute the forecast.
+
+    Takes a minute or two, so it runs in the background; the forecast sensor's
+    ``last_refresh`` attribute changes when it is done.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Resync Migraine Data"
+    _attr_icon = "mdi:database-refresh-outline"
+
+    def __init__(self, coordinator: GarminSyncCoordinator, entry: ConfigEntry) -> None:
+        self._coordinator = coordinator
+        self._entry = entry
+        email: str = entry.data.get(CONF_GARMIN_EMAIL, "")
+        self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}_migraine_resync_button"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=f"Garmin Hydration Sync ({email})",
+            manufacturer="Garmin",
+            model="Connect API",
+        )
+
+    async def async_press(self) -> None:
+        manager = self._coordinator.migraine
+        if manager is None:
+            return
+        if manager.refreshing:
+            raise HomeAssistantError("A migraine data download is already running.")
+        self._entry.async_create_background_task(
+            self.hass, manager.async_resync(), f"{DOMAIN}_migraine_resync_{self._entry.entry_id}"
+        )
 
 
 class HeadacheButton(ButtonEntity):
