@@ -14,6 +14,7 @@ No schedules, no polling — syncs are triggered in real time by sensor state-ch
 
 - **Hydration sync** — tracks daily mL totals and sends only the increment since the last push, preserving any manual entries in the Garmin app
 - **Weight sync** — each new weigh-in is uploaded as an independent entry to Garmin's scale history
+- **Migraine forecast (research)** — a daily score of how far last night's sleep, HRV and stress are from your own normal days, checked against your headache log
 - **Event-driven** — syncs fire immediately when a sensor changes, not on a timer
 - **Graceful handling of unavailable sensors** — unknown / unavailable states are silently skipped
 - **Token caching** — authenticates once; subsequent syncs restore the cached OAuth token with automatic refresh (no MFA re-prompts during normal use)
@@ -63,6 +64,48 @@ Enable **Sync Jump Rope sessions to Garmin** in the setup form or in the integra
 * One Garmin activity (type *Jump Rope*) per workout, never per jump: start time, duration, calories, and the jump count in the title.
 * Already-uploaded workouts are remembered by start time, so repeating an upload is harmless.
 * To **backfill** workouts already stored on the rope, press **Resend stored workouts** on the jump rope device.
+
+---
+
+## Migraine forecast (research)
+
+Enable **Migraine forecast** in the setup form or the options. Every morning the integration reads last night's
+sleep, HRV and resting heart rate plus yesterday's stress and Body Battery from Garmin, and measures how far
+they are from **your own normal days**. It is a personal change detector — not a diagnosis, and it never says a
+migraine is coming.
+
+How it works:
+
+1. **Data** — about 20 numbers per morning (overnight HRV, resting HR, sleep duration/score/stages, stress and
+   breathing during sleep, Body Battery at wake, yesterday's stress, steps and intensity minutes). The first
+   run downloads 60 days of history; after that it refreshes every 2 hours.
+2. **Headache log** — days you mark **Migraines: yes** in Garmin Connect's Lifestyle Logging are read
+   automatically ("no" and unanswered both mean no migraine). Garmin stores no clock time, so a migraine day is
+   assumed to start that afternoon; consecutive "yes" days count as one headache. For exact times you can also press **Headache Started** / **Headache Ended**, or call `log_headache` (past headaches
+   too). Each morning is then labelled by what happened afterwards: pre-headache (a headache began within 24 h),
+   during, after, or normal day (no headache 24 h before or 48 h after).
+3. **Baseline** — median and spread of your last 30 normal days (at least 7), using only days that were already
+   known to be normal that morning.
+4. **Score** — each number becomes a robust z-score; the *deviation index* is their root-mean-square. The
+   percentile says "further from your usual than X% of your normal days"; at 90% the status is `elevated`.
+5. **Does it work for you?** — once 5 pre-headache and 15 normal mornings have a score, the accuracy sensor
+   reports how well the index separates them (AUC; 0.5 = not at all), how many headaches were preceded by an
+   `elevated` morning, false alerts per week and the typical lead time.
+
+| Entity | Description |
+|--------|-------------|
+| `sensor.…_migraine_forecast` | `no_data` / `collecting_baseline` / `usual` / `elevated`; attributes hold the summary, indices and the three measures that moved most |
+| `sensor.…_migraine_deviation_index` | Today's deviation index |
+| `sensor.…_migraine_deviation_percentile` | Today's percentile against earlier normal days |
+| `sensor.…_migraine_forecast_accuracy` | AUC once there is enough data; details as attributes |
+| `sensor.…_headache_log` | Number of logged headaches; recent ones (with ids) as an attribute |
+| `button.…_headache_started` / `…_headache_ended` | One-tap logging |
+
+Services: `log_headache`, `end_headache`, `delete_headache`, `refresh_migraine_forecast` (`backfill_days` up to 365).
+
+Limits: history downloaded before you logged any headaches is treated as normal days, so log past headaches
+if you remember them. Until the accuracy sensor has a value, an `elevated` morning only means "unusual night",
+not "headache likely". `features_available` on the forecast sensor shows how many measures your watch provides.
 
 ---
 

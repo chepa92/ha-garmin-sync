@@ -36,3 +36,13 @@ KEY_LAST_SYNC_JUMPROPE   = "last_sync_jumprope"
 STATUS_OK    = "ok"
 STATUS_ERROR = "error"
 STATUS_IDLE  = "never"
+
+# ── Migraine forecast (autonomic, from Garmin sleep / HRV / stress) ──────────
+CONF_MIGRAINE_FORECAST = "migraine_forecast"
+
+SERVICE_LOG_HEADACHE       = "log_headache"
+SERVICE_END_HEADACHE       = "end_headache"
+SERVICE_DELETE_HEADACHE    = "delete_headache"
+SERVICE_REFRESH_MIGRAINE   = "refresh_migraine_forecast"
+
+SIGNAL_MIGRAINE_UPDATED = "garmin_hydration_sync_migraine_updated_{entry_id}"

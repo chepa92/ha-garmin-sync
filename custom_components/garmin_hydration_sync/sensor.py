@@ -37,6 +37,10 @@ async def async_setup_entry(
         GarminLastSyncAbWheelSensor(coordinator, entry),
         GarminLastSyncJumpRopeSensor(coordinator, entry),
     ]
+    if coordinator.migraine is not None:
+        from .migraine_sensor import migraine_sensors
+
+        entities.extend(migraine_sensors(coordinator.migraine, entry))
     async_add_entities(entities)
 
 

@@ -381,3 +381,49 @@ async def async_upload_jumprope_workout(
     return await hass.async_add_executor_job(
         _run_with_client, token_dir, email, password, prompt_mfa, _action
     )
+
+
+# ── Health data download (migraine forecast) ─────────────────────────────────
+
+async def async_fetch_health_days(
+    hass: HomeAssistant,
+    email: str,
+    password: str,
+    dates: list[str],
+) -> dict[str, Any]:
+    """Download sleep, HRV and daily stats for each ``YYYY-MM-DD`` in ``dates``.
+
+    Returns ``{"days": {date: {"sleep": ..., "hrv": ..., "stats": ..., "lifestyle": ...}}}`` with the raw
+    Garmin payloads (None where a call failed or the watch has no data). Keep ``dates``
+    short: the account's token lock is held for the whole batch.
+    """
+    import time
+
+    token_dir = hass.config.path(TOKEN_SUBDIR)
+
+    def _action(client: Any) -> Any:
+        days: dict[str, dict[str, Any]] = {}
+        for date_str in dates:
+            payload: dict[str, Any] = {}
+            for name, fetch in (
+                ("sleep", client.get_sleep_data),
+                ("hrv", client.get_hrv_data),
+                ("stats", client.get_stats),
+                # Lifestyle Logging ("Migraines: yes / no"); absent in old library versions.
+                ("lifestyle", getattr(client, "get_lifestyle_logging_data", None)),
+            ):
+                if fetch is None:
+                    payload[name] = None
+                    continue
+                try:
+                    payload[name] = fetch(date_str)
+                except Exception as exc:  # noqa: BLE001 - one missing metric must not lose the day
+                    LOGGER.debug("[GarminSync] %s for %s unavailable: %s", name, date_str, exc)
+                    payload[name] = None
+            days[date_str] = payload
+            time.sleep(0.2)  # stay well under Garmin's rate limit during a backfill
+        return {"days": days}
+
+    return await hass.async_add_executor_job(
+        _run_with_client, token_dir, email, password, None, _action
+    )

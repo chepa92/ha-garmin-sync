@@ -19,6 +19,7 @@ from .const import (
     CONF_WEIGHT_SENSOR,
     CONF_ABWHEEL_SYNC,
     CONF_JUMPROPE_SYNC,
+    CONF_MIGRAINE_FORECAST,
     DOMAIN,
     LOGGER,
 )
@@ -72,6 +73,10 @@ def _user_schema(defaults: dict[str, Any]) -> vol.Schema:
                 CONF_JUMPROPE_SYNC,
                 default=defaults.get(CONF_JUMPROPE_SYNC, False),
             ): selector.BooleanSelector(),
+            vol.Optional(
+                CONF_MIGRAINE_FORECAST,
+                default=defaults.get(CONF_MIGRAINE_FORECAST, False),
+            ): selector.BooleanSelector(),
         }
     )
 
@@ -110,6 +115,10 @@ def _options_schema(defaults: dict[str, Any]) -> vol.Schema:
                 CONF_JUMPROPE_SYNC,
                 default=bool(defaults.get(CONF_JUMPROPE_SYNC, False)),
             ): selector.BooleanSelector(),
+            vol.Optional(
+                CONF_MIGRAINE_FORECAST,
+                default=bool(defaults.get(CONF_MIGRAINE_FORECAST, False)),
+            ): selector.BooleanSelector(),
         }
     )
 
@@ -120,6 +129,7 @@ def _has_any_source(user_input: dict[str, Any]) -> bool:
         user_input.get(CONF_WEIGHT_SENSOR),
         user_input.get(CONF_ABWHEEL_SYNC, False),
         user_input.get(CONF_JUMPROPE_SYNC, False),
+        user_input.get(CONF_MIGRAINE_FORECAST, False),
     ])
 
 
@@ -331,6 +341,8 @@ class GarminHydrationSyncConfigFlow(ConfigFlow, domain=DOMAIN):
             data[CONF_ABWHEEL_SYNC] = True
         if self._stored_input.get(CONF_JUMPROPE_SYNC, False):
             data[CONF_JUMPROPE_SYNC] = True
+        if self._stored_input.get(CONF_MIGRAINE_FORECAST, False):
+            data[CONF_MIGRAINE_FORECAST] = True
         return self.async_create_entry(title=f"Garmin – {email}", data=data)
 
     def _finish_reauth(self) -> FlowResult:
@@ -422,6 +434,7 @@ class GarminHydrationSyncOptionsFlow(OptionsFlow):
                     CONF_WEIGHT_SENSOR: user_input.get(CONF_WEIGHT_SENSOR) or None,
                     CONF_ABWHEEL_SYNC: bool(user_input.get(CONF_ABWHEEL_SYNC, False)),
                     CONF_JUMPROPE_SYNC: bool(user_input.get(CONF_JUMPROPE_SYNC, False)),
+                    CONF_MIGRAINE_FORECAST: bool(user_input.get(CONF_MIGRAINE_FORECAST, False)),
                 }
                 return self.async_create_entry(title="", data=out)
             current = {**current, **user_input}

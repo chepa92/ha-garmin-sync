@@ -11,7 +11,8 @@
                     "water_sensor_entity": "Water intake sensor (mL today) – optional",
                     "weight_sensor_entity": "Body weight sensor (kg) – optional",
                     "abwheel_sync": "Sync Ab Wheel workouts to Garmin",
-                    "jumprope_sync": "Sync Jump Rope sessions to Garmin (one activity per session)"
+                    "jumprope_sync": "Sync Jump Rope sessions to Garmin (one activity per session)",
+                    "migraine_forecast": "Migraine forecast from Garmin sleep, HRV and stress (research, not a diagnosis)"
                 }
             },
             "mfa": {
@@ -31,7 +32,7 @@
         },
         "error": {
             "entity_not_found": "The selected sensor entity was not found.",
-            "no_sensors": "Select at least one sensor to sync.",
+            "no_sensors": "Select at least one sensor or feature.",
             "cannot_connect": "Could not connect to Garmin Connect. Check your e-mail/password and try again.",
             "invalid_mfa_code": "The verification code was incorrect. Please try again.",
             "invalid_mfa_code_resent": "The verification code was incorrect or expired. Garmin has sent a new code – enter the new one below."
@@ -51,13 +52,14 @@
                     "water_sensor_entity": "Water intake sensor (mL today) – optional",
                     "weight_sensor_entity": "Body weight sensor (kg) – optional",
                     "abwheel_sync": "Sync Ab Wheel workouts to Garmin",
-                    "jumprope_sync": "Sync Jump Rope sessions to Garmin (one activity per session)"
+                    "jumprope_sync": "Sync Jump Rope sessions to Garmin (one activity per session)",
+                    "migraine_forecast": "Migraine forecast from Garmin sleep, HRV and stress (research, not a diagnosis)"
                 }
             }
         },
         "error": {
             "entity_not_found": "The selected sensor entity was not found.",
-            "no_sensors": "Select at least one sensor to sync."
+            "no_sensors": "Select at least one sensor or feature."
         }
     },
     "services": {
@@ -68,6 +70,86 @@
                 "entry_id": {
                     "name": "Config entry ID",
                     "description": "Optional – target a specific Garmin account when multiple are configured."
+                }
+            }
+        },
+        "log_headache": {
+            "name": "Log a headache",
+            "description": "Adds a headache to the log used by the migraine forecast. Without an onset time it starts now. Past headaches can be logged too.",
+            "fields": {
+                "entry_id": {
+                    "name": "Config entry ID",
+                    "description": "Optional – target a specific Garmin account when multiple are configured."
+                },
+                "onset": {
+                    "name": "Onset",
+                    "description": "When the headache started (default: now)."
+                },
+                "end": {
+                    "name": "End",
+                    "description": "When it ended. Leave empty while it is ongoing."
+                },
+                "intensity": {
+                    "name": "Intensity",
+                    "description": "1 (mild) to 10 (worst)."
+                },
+                "aura": {
+                    "name": "Aura",
+                    "description": "Whether there was an aura."
+                },
+                "medication": {
+                    "name": "Medication",
+                    "description": "What was taken, if anything."
+                },
+                "notes": {
+                    "name": "Notes",
+                    "description": "Free text."
+                }
+            }
+        },
+        "end_headache": {
+            "name": "End a headache",
+            "description": "Sets the end of the most recent headache that is still open, or of the given one.",
+            "fields": {
+                "entry_id": {
+                    "name": "Config entry ID",
+                    "description": "Optional – target a specific Garmin account when multiple are configured."
+                },
+                "end": {
+                    "name": "End",
+                    "description": "When it ended (default: now)."
+                },
+                "headache_id": {
+                    "name": "Headache ID",
+                    "description": "ID from the Headache Log sensor. Default: the open headache."
+                }
+            }
+        },
+        "delete_headache": {
+            "name": "Delete a headache",
+            "description": "Removes a headache from the log.",
+            "fields": {
+                "entry_id": {
+                    "name": "Config entry ID",
+                    "description": "Optional – target a specific Garmin account when multiple are configured."
+                },
+                "headache_id": {
+                    "name": "Headache ID",
+                    "description": "ID from the Headache Log sensor."
+                }
+            }
+        },
+        "refresh_migraine_forecast": {
+            "name": "Refresh migraine forecast",
+            "description": "Downloads recent sleep, HRV and stress data from Garmin and recomputes the score. Use backfill_days to load more history.",
+            "fields": {
+                "entry_id": {
+                    "name": "Config entry ID",
+                    "description": "Optional – target a specific Garmin account when multiple are configured."
+                },
+                "backfill_days": {
+                    "name": "Backfill days",
+                    "description": "How many past days to (re)check, up to 365."
                 }
             }
         }

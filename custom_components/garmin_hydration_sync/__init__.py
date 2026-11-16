@@ -40,6 +40,7 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform, STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import Event, HomeAssistant, ServiceCall, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.storage import Store
@@ -64,6 +65,11 @@ from .const import (
     KEY_LAST_SYNC_JUMPROPE,
     LOGGER,
     SERVICE_SYNC_NOW,
+    CONF_MIGRAINE_FORECAST,
+    SERVICE_LOG_HEADACHE,
+    SERVICE_END_HEADACHE,
+    SERVICE_DELETE_HEADACHE,
+    SERVICE_REFRESH_MIGRAINE,
     STATUS_ERROR,
     STATUS_IDLE,
     STATUS_OK,
@@ -75,6 +81,7 @@ from .garmin_connect import (
     async_upload_abwheel_workout,
     parse_workout_start,
 )
+from .migraine_manager import MigraineForecastManager
 
 PLATFORMS: list[Platform] = [Platform.BUTTON, Platform.SENSOR]
 
@@ -162,6 +169,8 @@ class GarminSyncCoordinator(DataUpdateCoordinator):
         self._synced_jumprope: set[str] = set()
         self._pending_jumprope: set[str] = set()
         self._unsubs: list[Any] = []
+        # Set in async_setup_entry when the migraine forecast option is on.
+        self.migraine: MigraineForecastManager | None = None
 
     # ── Persistence ──────────────────────────────────────────────────────────
 
@@ -709,6 +718,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Seed coordinator data so sensors show "never" immediately on load
     coordinator.async_set_updated_data(coordinator.data)
 
+    # Migraine forecast (optional): created before the platforms so its sensors exist.
+    coordinator.migraine = None
+    if coordinator.get_config().get(CONF_MIGRAINE_FORECAST, False):
+        manager = MigraineForecastManager(hass, coordinator)
+        await manager.async_load()
+        coordinator.migraine = manager
+        manager.start()
+        entry.async_on_unload(manager.stop)
+        entry.async_create_background_task(
+            hass, manager.async_refresh(), f"{DOMAIN}_migraine_refresh_{entry.entry_id}"
+        )
+
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -745,8 +766,90 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             schema=vol.Schema({vol.Optional("entry_id"): cv.string}),
         )
 
+    _register_migraine_services(hass)
+
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
+
+
+_MIGRAINE_SERVICES = (
+    SERVICE_LOG_HEADACHE, SERVICE_END_HEADACHE, SERVICE_DELETE_HEADACHE, SERVICE_REFRESH_MIGRAINE,
+)
+
+
+def _register_migraine_services(hass: HomeAssistant) -> None:
+    """Headache log + manual refresh. Registered once; managers are looked up per call."""
+    if hass.services.has_service(DOMAIN, SERVICE_LOG_HEADACHE):
+        return
+
+    def _managers(call: ServiceCall) -> list[MigraineForecastManager]:
+        coordinators: dict[str, GarminSyncCoordinator] = hass.data.get(DOMAIN, {})
+        entry_id: str | None = call.data.get("entry_id")
+        managers = [
+            coord.migraine for key, coord in coordinators.items()
+            if coord.migraine is not None and (entry_id is None or key == entry_id)
+        ]
+        if not managers:
+            raise HomeAssistantError(
+                "Migraine forecast is not enabled - turn it on in the Garmin Sync options."
+            )
+        return managers
+
+    async def _log_headache(call: ServiceCall) -> None:
+        for manager in _managers(call):
+            try:
+                await manager.async_log_headache(
+                    onset=call.data.get("onset"),
+                    end=call.data.get("end"),
+                    intensity=call.data.get("intensity"),
+                    aura=call.data.get("aura", False),
+                    medication=call.data.get("medication"),
+                    notes=call.data.get("notes"),
+                )
+            except ValueError as exc:
+                raise HomeAssistantError(str(exc)) from exc
+
+    async def _end_headache(call: ServiceCall) -> None:
+        for manager in _managers(call):
+            try:
+                found = await manager.async_end_headache(call.data.get("end"), call.data.get("headache_id"))
+            except ValueError as exc:
+                raise HomeAssistantError(str(exc)) from exc
+            if not found:
+                raise HomeAssistantError("No open headache to end.")
+
+    async def _delete_headache(call: ServiceCall) -> None:
+        for manager in _managers(call):
+            if not await manager.async_delete_headache(call.data["headache_id"]):
+                raise HomeAssistantError(f"Headache {call.data['headache_id']} not found.")
+
+    async def _refresh(call: ServiceCall) -> None:
+        for manager in _managers(call):
+            await manager.async_refresh(call.data.get("backfill_days"))
+
+    entry_field = {vol.Optional("entry_id"): cv.string}
+    hass.services.async_register(DOMAIN, SERVICE_LOG_HEADACHE, _log_headache, schema=vol.Schema({
+        **entry_field,
+        vol.Optional("onset"): cv.datetime,
+        vol.Optional("end"): cv.datetime,
+        vol.Optional("intensity"): vol.All(vol.Coerce(int), vol.Range(min=1, max=10)),
+        vol.Optional("aura", default=False): cv.boolean,
+        vol.Optional("medication"): cv.string,
+        vol.Optional("notes"): cv.string,
+    }))
+    hass.services.async_register(DOMAIN, SERVICE_END_HEADACHE, _end_headache, schema=vol.Schema({
+        **entry_field,
+        vol.Optional("end"): cv.datetime,
+        vol.Optional("headache_id"): cv.string,
+    }))
+    hass.services.async_register(DOMAIN, SERVICE_DELETE_HEADACHE, _delete_headache, schema=vol.Schema({
+        **entry_field,
+        vol.Required("headache_id"): cv.string,
+    }))
+    hass.services.async_register(DOMAIN, SERVICE_REFRESH_MIGRAINE, _refresh, schema=vol.Schema({
+        **entry_field,
+        vol.Optional("backfill_days"): vol.All(vol.Coerce(int), vol.Range(min=1, max=365)),
+    }))
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -759,4 +862,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.data[DOMAIN].pop(entry.entry_id, None)
         if not hass.data[DOMAIN]:
             hass.services.async_remove(DOMAIN, SERVICE_SYNC_NOW)
+            for service in _MIGRAINE_SERVICES:
+                hass.services.async_remove(DOMAIN, service)
     return unload_ok
