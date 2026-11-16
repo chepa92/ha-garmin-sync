@@ -169,11 +169,22 @@ class MigraineEvaluationSensor(_MigraineSensor):
         evaluation = result.get("evaluation")
         if evaluation:
             return evaluation
+        # A day has a score only once enough earlier normal days exist to compare it with,
+        # so mornings at the start of the downloaded history are labelled but not scored.
+        days = result.get("days", [])
+        scored = [d for d in days if d["deviation_index"] is not None]
+        pre_scored = sum(1 for d in scored if d["label"] == "pre_headache")
+        normal_scored = sum(1 for d in scored if d["label"] == "normal")
         return {
+            "pre_headache_days_scored": pre_scored,
+            "pre_headache_days_labelled": result.get("pre_headache_days", 0),
+            "normal_days_scored": normal_scored,
             "summary": (
                 f"Needs {MIN_PRE_HEADACHE} pre-headache and {MIN_NORMAL} normal days with a score; "
-                f"labelled so far: {result.get('pre_headache_days', 0)} and {result.get('normal_days', 0)}."
-            )
+                f"so far {pre_scored} and {normal_scored}. Pre-headache days without a score are too "
+                "early in the downloaded history - load more with refresh_migraine_forecast "
+                "(backfill_days)."
+            ),
         }
 
 
